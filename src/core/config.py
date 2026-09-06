@@ -5,8 +5,13 @@ import os
 class Settings(BaseSettings):
     DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/mtg_utils?schema=public")
     DIRECT_URL: str = os.getenv("DIRECT_URL", "")
-    SUPABASE_URL: str = os.getenv("NEXT_PUBLIC_SUPABASE_URL", "")
-    SUPABASE_ANON_KEY: str = os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY", "")
+    SUPABASE_URL: str = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL", "")
+    SUPABASE_ANON_KEY: str = (
+        os.getenv("SUPABASE_ANON_KEY")
+        or os.getenv("NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY")
+        or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+        or ""
+    )
     SUPABASE_SERVICE_ROLE_KEY: str = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
     CARDTRADER_API_TOKEN: str = os.getenv("CARDTRADER_API_TOKEN", "")
     BACKEND_CORS_ORIGINS: List[str] = [
