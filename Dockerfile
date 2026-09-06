@@ -8,6 +8,10 @@ ENV PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     openssl \
     curl \
+    ca-certificates \
+    libatomic1 \
+    nodejs \
+    npm \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock ./
