@@ -226,32 +226,92 @@ class DeckService:
         )
 
     @staticmethod
-    async def update_deck(deck_id: str, user_id: str, data: DeckUpdate) -> Optional[DeckSummaryResponse]:
+    async def update_deck(deck_id: str, user_id: str, data: DeckUpdate) -> Optional[DeckDetailResponse]:
         deck = await db.deck.find_unique(where={"id": deck_id})
         if not deck or deck.userId != user_id:
             return None
 
         update_data: Dict[str, Any] = {}
         if data.name is not None:
-            update_data["name"] = data.name
+            update_data["name"] = data.name.strip()
         if data.format is not None:
             update_data["format"] = data.format
         if data.description is not None:
             update_data["description"] = data.description
+
+        # Handle commander update if provided
         if data.commander is not None:
-            update_data["commander"] = data.commander
-        if data.commanderScryfallId is not None:
-            update_data["commanderScryfallId"] = data.commanderScryfallId
-        if data.commanderImageUri is not None:
-            update_data["commanderImageUri"] = data.commanderImageUri
+            new_cmd = data.commander.strip()
+            if new_cmd:
+                scry_id = data.commanderScryfallId
+                img_uri = data.commanderImageUri
+                mana_cost = None
+                type_line = "Legendary Creature"
 
-        updated = await db.deck.update(
-            where={"id": deck_id},
-            data=update_data,
-            include={"cards": True}
-        )
+                if not scry_id or not img_uri:
+                    cat = await ScryfallService.get_or_resolve_catalog_card(new_cmd)
+                    if cat:
+                        scry_id = scry_id or cat.get("id")
+                        img_uri = img_uri or cat.get("imageUri")
+                        mana_cost = cat.get("manaCost")
+                        type_line = cat.get("typeLine") or "Legendary Creature"
 
-        return await DeckService.get_user_decks(user_id)
+                update_data["commander"] = new_cmd
+                update_data["commanderScryfallId"] = scry_id
+                update_data["commanderImageUri"] = img_uri
+
+                # Reset isCommander on existing cards in this deck
+                await db.deckcard.update_many(
+                    where={"deckId": deck_id},
+                    data={"isCommander": False}
+                )
+
+                # Check if card already exists in the deck
+                existing_card = await db.deckcard.find_first(
+                    where={"deckId": deck_id, "cardName": {"equals": new_cmd, "mode": "insensitive"}}
+                )
+
+                if existing_card:
+                    await db.deckcard.update(
+                        where={"id": existing_card.id},
+                        data={
+                            "isCommander": True,
+                            "cardName": new_cmd,
+                            "imageUri": img_uri or existing_card.imageUri,
+                        }
+                    )
+                else:
+                    await db.deckcard.create(
+                        data={
+                            "deckId": deck_id,
+                            "cardScryfallId": scry_id or f"cmd:{new_cmd}",
+                            "cardName": new_cmd,
+                            "quantity": 1,
+                            "assignedQuantity": 0,
+                            "isSideboard": False,
+                            "isCommander": True,
+                            "manaCost": mana_cost,
+                            "typeLine": type_line,
+                            "imageUri": img_uri,
+                        }
+                    )
+            else:
+                # Explicitly empty string - clear commander
+                update_data["commander"] = None
+                update_data["commanderScryfallId"] = None
+                update_data["commanderImageUri"] = None
+                await db.deckcard.update_many(
+                    where={"deckId": deck_id},
+                    data={"isCommander": False}
+                )
+
+        if update_data:
+            await db.deck.update(
+                where={"id": deck_id},
+                data=update_data,
+            )
+
+        return await DeckService.get_deck_detail(deck_id, user_id)
 
     @staticmethod
     async def delete_deck(deck_id: str, user_id: str) -> bool:

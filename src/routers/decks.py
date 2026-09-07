@@ -26,11 +26,12 @@ async def get_deck(deck_id: str, user_id: str = Depends(get_current_user_id)):
     return deck
 
 @router.put("/{deck_id}")
+@router.patch("/{deck_id}")
 async def update_deck(deck_id: str, data: DeckUpdate, user_id: str = Depends(get_current_user_id)):
     res = await DeckService.update_deck(deck_id, user_id, data)
     if res is None:
         raise HTTPException(status_code=404, detail="Mazo no encontrado")
-    return {"status": "success"}
+    return {"status": "success", "deck": res}
 
 @router.delete("/{deck_id}")
 async def delete_deck(deck_id: str, user_id: str = Depends(get_current_user_id)):
