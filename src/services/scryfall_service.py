@@ -297,8 +297,21 @@ class ScryfallService:
                         )
                         if res_search.status_code == 200:
                             s_data = res_search.json()
-                            if s_data.get("data") and len(s_data["data"]) > 0:
-                                es_card = s_data["data"][0]
+                            candidates = s_data.get("data", [])
+                            # Best match: same name and printed_name exists
+                            best = None
+                            for c in candidates:
+                                if c.get("printed_name") and c.get("name") == c_name:
+                                    best = c
+                                    break
+                            if not best:
+                                for c in candidates:
+                                    if c.get("printed_name"):
+                                        best = c
+                                        break
+                            if not best and candidates:
+                                best = candidates[0]
+                            es_card = best
                     except Exception as e:
                         logger.error(f"Error searching Spanish print for {c_name}: {e}")
 
@@ -311,7 +324,7 @@ class ScryfallService:
 
             if es_card:
                 name_es = es_card.get("printed_name") or es_card.get("name")
-                type_line_es = es_card.get("printed_type_line") or es_card.get("type_line")
+                type_line_es = es_card.get("printed_type_line")
                 oracle_text_es = es_card.get("printed_text") or es_card.get("oracle_text")
                 flavor_text_es = es_card.get("flavor_text")
 
@@ -319,6 +332,8 @@ class ScryfallService:
                 name_es = card_data.get("name")
             if not type_line_es:
                 type_line_es = ScryfallService._translate_type_line(card_data.get("type_line"))
+            else:
+                type_line_es = ScryfallService._translate_type_line(type_line_es)
             if not oracle_text_es:
                 oracle_text_es = card_data.get("oracle_text")
             if not flavor_text_es:
