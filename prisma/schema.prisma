@@ -98,4 +98,48 @@ model User {
   @@map("users")
 }
 
+model CardSet {
+  id           String         @id
+  code         String         @unique
+  name         String
+  setType      String         @map("set_type")
+  cardCount    Int            @default(0) @map("card_count")
+  releasedAt   DateTime?      @map("released_at")
+  iconSvgUri   String?        @map("icon_svg_uri")
+  searchUri    String         @map("search_uri")
+  isDigital    Boolean        @default(false) @map("is_digital")
+  isDownloaded Boolean        @default(false) @map("is_downloaded")
+  downloadedAt DateTime?      @map("downloaded_at")
+  createdAt    DateTime       @default(now()) @map("created_at")
+  updatedAt    DateTime       @updatedAt @map("updated_at")
+  printings    CardPrinting[]
 
+  @@map("card_sets")
+}
+
+model CardPrinting {
+  id              String    @id
+  cardName        String    @map("card_name")
+  normalizedName  String    @map("normalized_name")
+  setCode         String    @map("set_code")
+  collectorNumber String    @map("collector_number")
+  manaCost        String?   @map("mana_cost")
+  typeLine        String?   @map("type_line")
+  rarity          String?
+  imageUri        String?   @map("image_uri")
+  imageUriSmall   String?   @map("image_uri_small")
+  priceEur        Float?    @map("price_eur")
+  priceEurFoil    Float?    @map("price_eur_foil")
+  priceUsd        Float?    @map("price_usd")
+  priceUsdFoil    Float?    @map("price_usd_foil")
+  releasedAt      DateTime? @map("released_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  set             CardSet   @relation(fields: [setCode], references: [code], onDelete: Cascade)
+
+  @@unique([setCode, collectorNumber])
+  @@index([normalizedName])
+  @@index([setCode])
+  @@map("card_printings")
+}
