@@ -71,3 +71,51 @@ async def test_get_current_user_id_dependency():
     uid3 = await get_current_user_id(authorization="Bearer aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
     assert uid3 == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
+def test_password_hashing():
+    from src.services.auth_service import hash_password, verify_password
+
+    plain = "mox_emerald_secret_123"
+    hashed = hash_password(plain)
+
+    assert hashed != plain
+    assert ":" in hashed
+    assert verify_password(plain, hashed) is True
+    assert verify_password("wrong_password", hashed) is False
+    assert verify_password(plain, "corrupted_hash") is False
+
+@pytest.mark.asyncio
+async def test_local_signup_and_login():
+    from types import SimpleNamespace
+    from src.services.auth_service import hash_password
+
+    mock_db = AsyncMock()
+    mock_db.user = AsyncMock()
+
+    # Signup: user does not exist yet
+    mock_db.user.find_unique.return_value = None
+    mock_created = SimpleNamespace(
+        id="user-uuid-12345",
+        email="urza@magic.io",
+        name="urza",
+        passwordHash=hash_password("karn_golem_99"),
+    )
+    mock_db.user.create.return_value = mock_created
+
+    with patch("src.services.auth_service.db", mock_db):
+        res = await AuthService.signup("urza@magic.io", "karn_golem_99")
+        assert res.error is None
+        assert res.user is not None
+        assert res.user.email == "urza@magic.io"
+        assert res.accessToken is not None
+
+        # Login: user exists and password is valid
+        mock_db.user.find_unique.return_value = mock_created
+        login_res = await AuthService.login("urza@magic.io", "karn_golem_99")
+        assert login_res.error is None
+        assert login_res.user.id == "user-uuid-12345"
+
+        # Login: wrong password
+        login_fail = await AuthService.login("urza@magic.io", "wrong_pass")
+        assert login_fail.error == "Correo o contraseña incorrectos."
+
+
