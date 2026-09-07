@@ -20,3 +20,19 @@ async def get_card_named(name: str = Query(..., min_length=1), exact: bool = Que
 @router.post("/bulk")
 async def resolve_bulk(identifiers: List[Dict[str, Any]]):
     return await ScryfallService.resolve_cards_in_bulk(identifiers)
+
+@router.get("/card")
+async def get_card_details(
+    id: Optional[str] = Query(None),
+    name: Optional[str] = Query(None),
+    set: Optional[str] = Query(None),
+    collector_number: Optional[str] = Query(None),
+):
+    card = await ScryfallService.get_card_details_es(
+        card_id=id,
+        name=name,
+        set_code=set,
+        collector_number=collector_number,
+    )
+    return card or {}
+
