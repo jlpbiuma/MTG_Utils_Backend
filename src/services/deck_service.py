@@ -4,13 +4,79 @@ from typing import List, Dict, Any, Optional
 from src.core.db import db
 from src.schemas.deck import (
     DeckCreate, DeckUpdate, DeckSummaryResponse, DeckDetailResponse,
-    DeckCardWithOwnership, DeckCardCreate, OtherDeckAssignment
+    DeckCardWithOwnership, DeckCardCreate, OtherDeckAssignment, DeckRequirement
 )
-from src.services.card_utils import normalize_card_name, get_card_category
+from src.services.card_utils import (
+    normalize_card_name,
+    get_card_category,
+    is_basic_land,
+    extract_colors_from_mana_cost,
+    combine_colors_from_mana_costs,
+)
 from src.services.scryfall_service import ScryfallService
 from src.services.import_service import parse_decklist_text
+from src.services.enrichment_service import trigger_async_priority_enrichment
+from src.services.image_resolver import resolve_minio_image_uris, safe_image_uri
+from src.services.pricing_service import PricingService
+
+DECK_PRICE_PROVIDER = "cardmarket"
+DECK_PRICE_CURRENCY = "EUR"
+DECK_PRICE_SYMBOL = "€"
 
 logger = logging.getLogger("mtg_backend.decks")
+
+
+def is_commander_candidate_type(type_line: Optional[str], oracle_text: Optional[str] = None) -> bool:
+    """Return whether a card type is eligible for the commander picker.
+
+    Legendary creatures and legendary vehicles are always candidates. Legendary
+    planeswalkers are candidates only when their oracle text explicitly grants
+    the ability with the "{name} can be your commander" clause.
+    """
+    type_value = (type_line or "").lower()
+    is_legendary = "legendary" in type_value
+    is_legendary_creature = is_legendary and "creature" in type_value
+    is_legendary_vehicle = (
+        is_legendary
+        and "artifact" in type_value
+        and "vehicle" in type_value
+    )
+    is_legendary_planeswalker = is_legendary and "planeswalker" in type_value
+    allows_commander = bool(oracle_text) and "can be your commander" in (oracle_text or "").lower()
+    return (
+        is_legendary_creature
+        or is_legendary_vehicle
+        or (is_legendary_planeswalker and allows_commander)
+    )
+
+
+async def _is_commander_eligible(card_name: str, type_line: Optional[str]) -> bool:
+    """Decide server-side whether a card may be the deck's commander.
+
+    Legendary creatures and vehicles are decided by the type line alone.
+    Legendary planeswalkers are only eligible when their oracle text states
+    "{name} can be your commander"; the text is read from the local catalog
+    (worker-hydrated details) with a live Scryfall lookup as last resort. The
+    frontend consumes the resulting flag instead of re-deriving this rule.
+    """
+    type_value = (type_line or "").lower()
+    if "legendary" not in type_value or "planeswalker" not in type_value:
+        return is_commander_candidate_type(type_line)
+
+    oracle_text: Optional[str] = None
+    try:
+        cat = await ScryfallService.get_catalog_card(card_name)
+        if cat:
+            oracle_text = cat.get("oracleText")
+        if oracle_text is None:
+            card = await ScryfallService.get_card_named(card_name)
+            if card:
+                oracle_text = card.get("oracle_text")
+    except Exception:
+        logger.warning("Could not resolve commander eligibility for %s", card_name, exc_info=True)
+
+    return is_commander_candidate_type(type_line, oracle_text)
+
 
 class DeckService:
     @staticmethod
@@ -25,23 +91,65 @@ class DeckService:
         collection_cards = await db.collectioncard.find_many(where={"userId": user_id})
         col_map = {normalize_card_name(c.cardName): c.quantity for c in collection_cards}
 
+        # Resolve market prices (DB only) for every unique card across all decks.
+        all_cards = []
+        for d in decks:
+            all_cards.extend(
+                {"name": c.cardName, "scryfallId": c.cardScryfallId, "quantity": c.quantity}
+                for c in (d.cards or [])
+            )
+        price_memo: Dict[str, Optional[float]] = {}
+        unique_cards = []
+        seen_ids = set()
+        for card in all_cards:
+            card_id = card.get("scryfallId") or ""
+            if not card_id or card_id in seen_ids:
+                continue
+            seen_ids.add(card_id)
+            unique_cards.append(card)
+
+        batch_quotes = await PricingService.get_latest_quotes_batch(
+            unique_cards,
+            DECK_PRICE_PROVIDER,
+            DECK_PRICE_CURRENCY,
+        )
+        for card in unique_cards:
+            cid = card.get("scryfallId") or ""
+            norm = normalize_card_name(card.get("name", ""))
+            q = batch_quotes.get(cid) or batch_quotes.get(norm)
+            price_memo[cid] = q.unitPrice.trend if q else None
+
         summaries: List[DeckSummaryResponse] = []
         for d in decks:
             cards = d.cards or []
-            total = sum(c.quantity for c in cards)
             unique = len(cards)
 
-            # Calculate owned
+            # Calculate owned. Basic lands never count toward completion:
+            # they are excluded from both the numerator (owned) and the
+            # denominator (total), but still contribute to the deck's value.
+            total = 0
             owned = 0
+            total_value = 0.0
+            missing_value = 0.0
+            owned_value = 0.0
             for c in cards:
                 norm = normalize_card_name(c.cardName)
                 in_col = col_map.get(norm, 0)
                 assigned = c.assignedQuantity or 0
                 actual_owned = min(c.quantity, max(assigned, min(in_col, c.quantity)))
-                owned += actual_owned
+
+                if not is_basic_land(c.typeLine, c.cardName):
+                    total += c.quantity
+                    owned += actual_owned
+
+                unit = price_memo.get(c.cardScryfallId) or 0.0
+                total_value += unit * c.quantity
+                missing_value += unit * (c.quantity - actual_owned)
+                owned_value += unit * actual_owned
 
             missing = max(0, total - owned)
             pct = round((owned / total) * 100, 1) if total > 0 else 0.0
+            colors = combine_colors_from_mana_costs([c.manaCost for c in cards])
 
             summaries.append(DeckSummaryResponse(
                 id=d.id,
@@ -51,7 +159,7 @@ class DeckService:
                 description=d.description,
                 commander=d.commander,
                 commanderScryfallId=d.commanderScryfallId,
-                commanderImageUri=d.commanderImageUri,
+                commanderImageUri=safe_image_uri(d.commanderImageUri),
                 createdAt=d.createdAt,
                 updatedAt=d.updatedAt,
                 totalCards=total,
@@ -59,6 +167,13 @@ class DeckService:
                 ownedCards=owned,
                 missingCards=missing,
                 completionPercentage=pct,
+                colors=colors,
+                colorIdentity="".join(colors),
+                totalValue=round(total_value, 2) if total_value else None,
+                missingValue=round(missing_value, 2) if missing_value else None,
+                ownedValue=round(owned_value, 2) if owned_value else None,
+                currency=DECK_PRICE_CURRENCY,
+                currencySymbol=DECK_PRICE_SYMBOL,
             ))
 
         return summaries
@@ -76,25 +191,90 @@ class DeckService:
         collection_cards = await db.collectioncard.find_many(where={"userId": deck.userId})
         col_map = {normalize_card_name(c.cardName): c.quantity for c in collection_cards}
 
-        # Fetch other decks cards to detect cross-deck assignments
-        other_cards = await db.deckcard.find_many(
-            where={"deckId": {"not": deck_id}, "assignedQuantity": {"gt": 0}},
+        # Prefer locally-mirrored (MinIO) images over upstream Scryfall URLs.
+        deck_card_ids = [c.cardScryfallId for c in (deck.cards or []) if c.cardScryfallId]
+        local_images = await resolve_minio_image_uris(deck_card_ids)
+
+        # Seed requested_in_decks with the current deck's cards
+        decks_by_norm: Dict[str, Dict[str, DeckRequirement]] = {}
+        for c in (deck.cards or []):
+            norm = normalize_card_name(c.cardName)
+            if norm not in decks_by_norm:
+                decks_by_norm[norm] = {}
+            if deck.id not in decks_by_norm[norm]:
+                decks_by_norm[norm][deck.id] = DeckRequirement(
+                    deckId=deck.id,
+                    deckName=deck.name,
+                    quantity=c.quantity,
+                )
+            else:
+                decks_by_norm[norm][deck.id].quantity += c.quantity
+
+        # Fetch other cards of this user to detect cross-deck assignments and multi-deck demand
+        user_deck_cards = await db.deckcard.find_many(
+            where={"deck": {"userId": deck.userId}},
             include={"deck": True}
         )
         assigned_in_others: Dict[str, List[OtherDeckAssignment]] = {}
-        for oc in other_cards:
+        for oc in (user_deck_cards or []):
             norm = normalize_card_name(oc.cardName)
-            if norm not in assigned_in_others:
-                assigned_in_others[norm] = []
-            assigned_in_others[norm].append(OtherDeckAssignment(
-                deckId=oc.deckId,
-                deckName=oc.deck.name if oc.deck else "Otro Mazo",
-                quantity=oc.assignedQuantity
-            ))
+            # 1. Assigned copies in other decks
+            if oc.deckId != deck_id and (oc.assignedQuantity or 0) > 0:
+                if norm not in assigned_in_others:
+                    assigned_in_others[norm] = []
+                assigned_in_others[norm].append(OtherDeckAssignment(
+                    deckId=oc.deckId,
+                    deckName=oc.deck.name if oc.deck else "Otro Mazo",
+                    quantity=oc.assignedQuantity
+                ))
+
+            # 2. Decks requesting this card
+            if oc.deckId != deck_id:
+                deck_obj = getattr(oc, "deck", None)
+                d_name = deck_obj.name if (deck_obj and isinstance(getattr(deck_obj, "name", None), str)) else "Otro Mazo"
+                if norm not in decks_by_norm:
+                    decks_by_norm[norm] = {}
+                if oc.deckId not in decks_by_norm[norm]:
+                    decks_by_norm[norm][oc.deckId] = DeckRequirement(
+                        deckId=oc.deckId,
+                        deckName=d_name,
+                        quantity=oc.quantity,
+                    )
+                else:
+                    decks_by_norm[norm][oc.deckId].quantity += oc.quantity
+
+        # Resolve market prices (DB only) for every unique card in this deck
+        price_memo: Dict[str, Optional[float]] = {}
+        unique_deck_cards = []
+        seen_ids = set()
+        for c in (deck.cards or []):
+            card_id = c.cardScryfallId or ""
+            if not card_id or card_id in seen_ids:
+                continue
+            seen_ids.add(card_id)
+            unique_deck_cards.append({"name": c.cardName, "scryfallId": card_id})
+
+        try:
+            batch_quotes = await PricingService.get_latest_quotes_batch(
+                unique_deck_cards,
+                DECK_PRICE_PROVIDER,
+                DECK_PRICE_CURRENCY,
+            )
+            for card in unique_deck_cards:
+                cid = card["scryfallId"]
+                norm = normalize_card_name(card["name"])
+                q = batch_quotes.get(cid) or batch_quotes.get(norm)
+                price_memo[cid] = q.unitPrice.trend if q else None
+        except Exception:
+            for card in unique_deck_cards:
+                price_memo[card["scryfallId"]] = None
 
         cards_with_ownership: List[DeckCardWithOwnership] = []
         total = 0
         owned = 0
+        total_value = 0.0
+        missing_value = 0.0
+        owned_value = 0.0
 
         for c in (deck.cards or []):
             norm = normalize_card_name(c.cardName)
@@ -103,31 +283,67 @@ class DeckService:
             total_in_other_decks = sum(o.quantity for o in other_assigned_list)
 
             avail = max(0, col_qty - total_in_other_decks - c.assignedQuantity)
-            missing = max(0, c.quantity - c.assignedQuantity)
 
-            total += c.quantity
-            owned += c.assignedQuantity
+            # A card line is satisfied either by copies physically assigned to
+            # this deck or by copies already present in the collection. Mirrors
+            # DeckService.get_user_decks so per-card missingCount, deck-level
+            # stats, and the list view all agree.
+            actual_owned = min(c.quantity, max(c.assignedQuantity or 0, min(col_qty, c.quantity)))
+
+            # Basic lands never count toward completion: excluded from the
+            # numerator (owned) and the denominator (total) and never reported
+            # as missing. Their value still counts toward the deck's total.
+            is_basic = is_basic_land(c.typeLine, c.cardName)
+            if not is_basic:
+                total += c.quantity
+                owned += actual_owned
+            missing = 0 if is_basic else max(0, c.quantity - actual_owned)
+
+            unit = price_memo.get(c.cardScryfallId) or 0.0
+
+            total_value += unit * c.quantity
+            missing_value += unit * missing
+            owned_value += unit * actual_owned
 
             # Auto-enrich type line if missing
             type_line = c.typeLine
             mana_cost = c.manaCost
-            img_uri = c.imageUri
+            img_uri = local_images.get(c.cardScryfallId) or safe_image_uri(c.imageUri)
 
             if not type_line or not img_uri:
-                cat = await ScryfallService.get_or_resolve_catalog_card(c.cardName)
-                if cat:
-                    type_line = type_line or cat.get("typeLine")
-                    mana_cost = mana_cost or cat.get("manaCost")
-                    img_uri = img_uri or cat.get("imageUri")
-                    # Update in background / async
-                    await db.deckcard.update(
-                        where={"id": c.id},
-                        data={
-                            "typeLine": type_line,
-                            "manaCost": mana_cost,
-                            "imageUri": img_uri,
-                        }
+                # Enrichment is deliberately best effort. A catalog/Scryfall
+                # outage (or a stale card row) must not turn an otherwise
+                # readable deck into a 500 response.
+                try:
+                    cat = await ScryfallService.get_or_resolve_catalog_card(c.cardName)
+                    if cat:
+                        type_line = type_line or cat.get("typeLine")
+                        mana_cost = mana_cost or cat.get("manaCost")
+                        img_uri = img_uri or cat.get("imageUri")
+                        await db.deckcard.update(
+                            where={"id": c.id},
+                            data={
+                                "typeLine": type_line,
+                                "manaCost": mana_cost,
+                                "imageUri": img_uri,
+                            }
+                        )
+                except Exception:
+                    logger.warning(
+                        "Could not enrich deck card %s (%s); returning stored values",
+                        c.id,
+                        c.cardName,
+                        exc_info=True,
                     )
+
+            can_be_commander = await _is_commander_eligible(c.cardName, type_line)
+
+            req_dict = decks_by_norm.get(norm, {})
+            req_list = sorted(
+                list(req_dict.values()),
+                key=lambda r: (0 if r.deckId == deck_id else 1, r.deckName.lower())
+            )
+            req_count = len(req_list)
 
             cards_with_ownership.append(DeckCardWithOwnership(
                 id=c.id,
@@ -141,14 +357,22 @@ class DeckService:
                 manaCost=mana_cost,
                 typeLine=type_line,
                 imageUri=img_uri,
+                setCode=c.setCode,
                 ownedInCollection=col_qty,
                 availableToAssign=avail,
                 assignedInOtherDecks=other_assigned_list,
+                requestedInDecks=req_list,
+                requestedInDecksCount=req_count,
                 missingCount=missing,
+                canBeCommander=can_be_commander,
             ))
 
         missing_cards = max(0, total - owned)
         pct = round((owned / total) * 100, 1) if total > 0 else 0.0
+
+        net_val = round(total_value, 2) if total_value else None
+        miss_val = round(missing_value, 2) if missing_value else None
+        own_val = round(net_val - miss_val, 2) if (net_val is not None and miss_val is not None) else (round(owned_value, 2) if owned_value else None)
 
         return DeckDetailResponse(
             id=deck.id,
@@ -158,7 +382,7 @@ class DeckService:
             description=deck.description,
             commander=deck.commander,
             commanderScryfallId=deck.commanderScryfallId,
-            commanderImageUri=deck.commanderImageUri,
+            commanderImageUri=safe_image_uri(deck.commanderImageUri),
             createdAt=deck.createdAt,
             updatedAt=deck.updatedAt,
             totalCards=total,
@@ -166,6 +390,11 @@ class DeckService:
             ownedCards=owned,
             missingCards=missing_cards,
             completionPercentage=pct,
+            totalValue=net_val,
+            missingValue=miss_val,
+            ownedValue=own_val,
+            currency=DECK_PRICE_CURRENCY,
+            currencySymbol=DECK_PRICE_SYMBOL,
             cards=cards_with_ownership,
         )
 
@@ -184,13 +413,15 @@ class DeckService:
         )
 
         # If commander provided, add commander card to deck
+        commander_colors: List[str] = []
         if data.commander and data.commander.strip():
             cmd_name = data.commander.strip()
-            cat = await ScryfallService.get_or_resolve_catalog_card(cmd_name)
-            scry_id = data.commanderScryfallId or (cat.get("id") if cat else f"cmd:{cmd_name}")
+            cat = await ScryfallService.get_catalog_card(cmd_name)
+            scry_id = data.commanderScryfallId or (cat.get("id") if cat else f"pending:{cmd_name}")
             img_uri = data.commanderImageUri or (cat.get("imageUri") if cat else None)
             mana_cost = cat.get("manaCost") if cat else None
             type_line = cat.get("typeLine") if cat else "Legendary Creature"
+            commander_colors = extract_colors_from_mana_cost(mana_cost)
 
             await db.deckcard.create(
                 data={
@@ -206,6 +437,9 @@ class DeckService:
                     "imageUri": img_uri,
                 }
             )
+
+            # Prioritize resolution of the freshly added commander immediately
+            trigger_async_priority_enrichment([cmd_name])
 
         return DeckSummaryResponse(
             id=created.id,
@@ -223,6 +457,13 @@ class DeckService:
             ownedCards=0,
             missingCards=1 if data.commander else 0,
             completionPercentage=0.0,
+            colors=commander_colors,
+            colorIdentity="".join(commander_colors),
+            totalValue=None,
+            missingValue=None,
+            ownedValue=None,
+            currency=DECK_PRICE_CURRENCY,
+            currencySymbol=DECK_PRICE_SYMBOL,
         )
 
     @staticmethod
@@ -240,6 +481,7 @@ class DeckService:
             update_data["description"] = data.description
 
         # Handle commander update if provided
+        new_cmd = None
         if data.commander is not None:
             new_cmd = data.commander.strip()
             if new_cmd:
@@ -249,7 +491,7 @@ class DeckService:
                 type_line = "Legendary Creature"
 
                 if not scry_id or not img_uri:
-                    cat = await ScryfallService.get_or_resolve_catalog_card(new_cmd)
+                    cat = await ScryfallService.get_catalog_card(new_cmd)
                     if cat:
                         scry_id = scry_id or cat.get("id")
                         img_uri = img_uri or cat.get("imageUri")
@@ -305,6 +547,9 @@ class DeckService:
                     data={"isCommander": False}
                 )
 
+        if update_data and new_cmd:
+            trigger_async_priority_enrichment([new_cmd])
+
         if update_data:
             await db.deck.update(
                 where={"id": deck_id},
@@ -324,17 +569,38 @@ class DeckService:
         return True
 
     @staticmethod
-    async def set_commander(deck_id: str, user_id: str, commander_name: str, scryfall_id: Optional[str] = None, image_uri: Optional[str] = None) -> bool:
+    async def set_commander(
+        deck_id: str,
+        user_id: str,
+        commander_name: str,
+        scryfall_id: Optional[str] = None,
+        image_uri: Optional[str] = None,
+        partner_name: Optional[str] = None,
+        partner_scryfall_id: Optional[str] = None,
+        partner_image_uri: Optional[str] = None,
+    ) -> bool:
         deck = await db.deck.find_unique(where={"id": deck_id})
         if not deck or deck.userId != user_id:
             return False
 
+        partner_name = partner_name.strip() if partner_name and partner_name.strip() else None
+        if partner_name:
+            partner_scryfall_id = partner_scryfall_id or None
+            partner_image_uri = partner_image_uri or None
+
         # If scryfall metadata missing, resolve
         if not scryfall_id or not image_uri:
-            cat = await ScryfallService.get_or_resolve_catalog_card(commander_name)
+            cat = await ScryfallService.get_catalog_card(commander_name)
             if cat:
                 scryfall_id = scryfall_id or cat.get("id")
                 image_uri = image_uri or cat.get("imageUri")
+        if partner_name and (not partner_scryfall_id or not partner_image_uri):
+            cat = await ScryfallService.get_catalog_card(partner_name)
+            if cat:
+                partner_scryfall_id = partner_scryfall_id or cat.get("id")
+                partner_image_uri = partner_image_uri or cat.get("imageUri")
+
+        commander_value = f"{commander_name} // {partner_name}" if partner_name else commander_name
 
         # Reset isCommander on all cards in this deck
         await db.deckcard.update_many(
@@ -346,36 +612,36 @@ class DeckService:
         await db.deck.update(
             where={"id": deck_id},
             data={
-                "commander": commander_name,
+                "commander": commander_value,
                 "commanderScryfallId": scryfall_id,
                 "commanderImageUri": image_uri,
             }
         )
 
         # Check if card exists in deck
-        norm = normalize_card_name(commander_name)
-        existing = await db.deckcard.find_first(
-            where={"deckId": deck_id, "cardName": {"equals": commander_name, "mode": "insensitive"}}
-        )
-
-        if existing:
-            await db.deckcard.update(
-                where={"id": existing.id},
-                data={"isCommander": True}
+        commanders = [(commander_name, scryfall_id, image_uri)]
+        if partner_name:
+            commanders.append((partner_name, partner_scryfall_id, partner_image_uri))
+        for name, card_id, card_image in commanders:
+            existing = await db.deckcard.find_first(
+                where={"deckId": deck_id, "cardName": {"equals": name, "mode": "insensitive"}}
             )
-        else:
-            await db.deckcard.create(
-                data={
+            if existing:
+                await db.deckcard.update(where={"id": existing.id}, data={"isCommander": True})
+            else:
+                await db.deckcard.create(data={
                     "deckId": deck_id,
-                    "cardScryfallId": scryfall_id or f"cmd:{commander_name}",
-                    "cardName": commander_name,
+                    "cardScryfallId": card_id or f"pending:{name}",
+                    "cardName": name,
                     "quantity": 1,
                     "assignedQuantity": 0,
                     "isSideboard": False,
                     "isCommander": True,
-                    "imageUri": image_uri,
-                }
-            )
+                    "imageUri": card_image,
+                })
+
+        # Prioritize resolution of the newly set commander immediately
+        trigger_async_priority_enrichment([name for name, _, _ in commanders])
 
         return True
 
@@ -385,12 +651,13 @@ class DeckService:
         if not deck or deck.userId != user_id:
             return False
 
-        # Resolve card catalog
-        cat = await ScryfallService.get_or_resolve_catalog_card(data.cardName)
+        # The request path is database-only. The priority worker owns the
+        # Scryfall fallback when this card is not in CardCatalog yet.
+        cat = await ScryfallService.get_catalog_card(data.cardName)
         mana_cost = data.manaCost or (cat.get("manaCost") if cat else None)
         type_line = data.typeLine or (cat.get("typeLine") if cat else None)
         image_uri = data.imageUri or (cat.get("imageUri") if cat else None)
-        scry_id = data.cardScryfallId or (cat.get("id") if cat else f"scry:{data.cardName}")
+        scry_id = data.cardScryfallId or (cat.get("id") if cat else f"pending:{data.cardName}")
 
         existing = await db.deckcard.find_first(
             where={"deckId": deck_id, "cardScryfallId": scry_id, "isSideboard": data.isSideboard}
@@ -414,13 +681,24 @@ class DeckService:
                     "manaCost": mana_cost,
                     "typeLine": type_line,
                     "imageUri": image_uri,
+                    "setCode": data.setCode,
                 }
             )
+
+        # Prioritize resolution of the freshly added card immediately
+        trigger_async_priority_enrichment([data.cardName])
 
         return True
 
     @staticmethod
-    async def update_card_quantity(card_id: str, user_id: str, quantity: int) -> bool:
+    async def update_card_quantity(
+        card_id: str,
+        user_id: str,
+        quantity: int,
+        set_code: Optional[str] = None,
+        *,
+        set_code_provided: bool = False,
+    ) -> bool:
         card = await db.deckcard.find_unique(where={"id": card_id}, include={"deck": True})
         if not card or not card.deck or card.deck.userId != user_id:
             return False
@@ -429,10 +707,89 @@ class DeckService:
             await db.deckcard.delete(where={"id": card_id})
         else:
             new_assigned = min(card.assignedQuantity, quantity)
+            update_data: Dict[str, Any] = {
+                "quantity": quantity,
+                "assignedQuantity": new_assigned,
+            }
+            if set_code_provided:
+                update_data["setCode"] = set_code or None
             await db.deckcard.update(
                 where={"id": card_id},
-                data={"quantity": quantity, "assignedQuantity": new_assigned}
+                data=update_data
             )
+        return True
+
+    @staticmethod
+    async def update_card_version(
+        card_id: str,
+        user_id: str,
+        card_scryfall_id: str,
+        image_uri: Optional[str] = None,
+        set_code: Optional[str] = None,
+    ) -> bool:
+        card = await db.deckcard.find_unique(where={"id": card_id}, include={"deck": True})
+        if not card or not card.deck or card.deck.userId != user_id:
+            return False
+
+        effective_image = safe_image_uri(image_uri) or image_uri
+
+        if card.cardScryfallId == card_scryfall_id:
+            update_data: Dict[str, Any] = {}
+            if effective_image:
+                update_data["imageUri"] = effective_image
+            if set_code is not None:
+                update_data["setCode"] = set_code
+            if update_data:
+                await db.deckcard.update(where={"id": card_id}, data=update_data)
+        else:
+            conflict = await db.deckcard.find_first(
+                where={
+                    "deckId": card.deckId,
+                    "cardScryfallId": card_scryfall_id,
+                    "isSideboard": card.isSideboard,
+                    "id": {"not": card_id},
+                }
+            )
+            if conflict:
+                await db.deckcard.update(
+                    where={"id": conflict.id},
+                    data={
+                        "quantity": conflict.quantity + card.quantity,
+                        "assignedQuantity": conflict.assignedQuantity + card.assignedQuantity,
+                        "imageUri": effective_image or conflict.imageUri,
+                        "setCode": set_code or conflict.setCode,
+                    },
+                )
+                await db.deckcard.delete(where={"id": card_id})
+            else:
+                update_data = {
+                    "cardScryfallId": card_scryfall_id,
+                }
+                if effective_image:
+                    update_data["imageUri"] = effective_image
+                if set_code is not None:
+                    update_data["setCode"] = set_code
+                await db.deckcard.update(
+                    where={"id": card_id},
+                    data=update_data,
+                )
+
+        is_cmd = card.isCommander
+        if not is_cmd and card.deck.commander:
+            is_cmd = (
+                normalize_card_name(card.deck.commander) == normalize_card_name(card.cardName)
+                or card.deck.commanderScryfallId == card.cardScryfallId
+            )
+
+        if is_cmd:
+            await db.deck.update(
+                where={"id": card.deckId},
+                data={
+                    "commanderScryfallId": card_scryfall_id,
+                    "commanderImageUri": effective_image or card.imageUri,
+                },
+            )
+
         return True
 
     @staticmethod
@@ -500,7 +857,7 @@ class DeckService:
             missing = card.missingCount
             if missing > 0:
                 existing = await db.collectioncard.find_unique(
-                    where={"userId_cardScryfallId": {"userId": user_id, "cardScryfallId": card.cardScryfallId}}
+                    where={"userId_cardScryfallId": {"userId": user_id, "cardScryfallId": card.cardScryfallId, "isFoil": False}}
                 )
                 if existing:
                     await db.collectioncard.update(
@@ -527,6 +884,19 @@ class DeckService:
     async def import_deck_text(user_id: str, name: str, raw_text: str, format: str = "Commander", commander: Optional[str] = None) -> DeckSummaryResponse:
         parsed_cards = parse_decklist_text(raw_text)
 
+        # Exporters can repeat a card in multiple sections/lines. Consolidate
+        # equivalent entries before inserting because DeckCard has a unique
+        # constraint on (deck, card id, sideboard).
+        consolidated = {}
+        for item in parsed_cards:
+            key = (normalize_card_name(item.name), item.isSideboard, item.setCode, item.collectorNumber)
+            if key not in consolidated:
+                consolidated[key] = item
+            else:
+                consolidated[key].quantity += item.quantity
+                consolidated[key].isCommander = consolidated[key].isCommander or item.isCommander
+        parsed_cards = list(consolidated.values())
+
         # Detect commander from parsed cards if marked or not provided
         cmd_candidate = commander
         for p in parsed_cards:
@@ -544,10 +914,12 @@ class DeckService:
         )
 
         # Bulk create cards
+        imported_mana_costs: List[Optional[str]] = []
         for item in parsed_cards:
-            cat = await ScryfallService.get_or_resolve_catalog_card(item.name)
+            cat = await ScryfallService.get_catalog_card(item.name)
             scry_id = cat.get("id") if cat else f"pending:{item.name}"
             is_cmd = item.isCommander or (cmd_candidate and normalize_card_name(item.name) == normalize_card_name(cmd_candidate))
+            imported_mana_costs.append(cat.get("manaCost") if cat else None)
 
             await db.deckcard.create(
                 data={
@@ -564,6 +936,10 @@ class DeckService:
                 }
             )
 
+        # Prioritize resolution of all freshly imported cards immediately
+        trigger_async_priority_enrichment([item.name for item in parsed_cards])
+
+        colors = combine_colors_from_mana_costs(imported_mana_costs)
         return DeckSummaryResponse(
             id=deck.id,
             userId=deck.userId,
@@ -577,4 +953,11 @@ class DeckService:
             ownedCards=0,
             missingCards=sum(c.quantity for c in parsed_cards),
             completionPercentage=0.0,
+            colors=colors,
+            colorIdentity="".join(colors),
+            totalValue=None,
+            missingValue=None,
+            ownedValue=None,
+            currency=DECK_PRICE_CURRENCY,
+            currencySymbol=DECK_PRICE_SYMBOL,
         )

@@ -3,7 +3,7 @@ from typing import List, Optional
 from src.core.auth import get_current_user_id
 from src.schemas.deck import (
     DeckCreate, DeckUpdate, DeckSummaryResponse, DeckDetailResponse,
-    DeckCardCreate, DeckCardUpdateQuantity, DeckCardAssign,
+    DeckCardCreate, DeckCardUpdateQuantity, DeckCardUpdateVersion, DeckCardAssign,
     DeckCardRelease, DeckCardReassign, SetCommanderRequest
 )
 from src.services.deck_service import DeckService
@@ -47,7 +47,10 @@ async def set_deck_commander(deck_id: str, data: SetCommanderRequest, user_id: s
         user_id=user_id,
         commander_name=data.commander,
         scryfall_id=data.commanderScryfallId,
-        image_uri=data.commanderImageUri
+        image_uri=data.commanderImageUri,
+        partner_name=data.partner,
+        partner_scryfall_id=data.partnerScryfallId,
+        partner_image_uri=data.partnerImageUri,
     )
     if not ok:
         raise HTTPException(status_code=404, detail="Mazo no encontrado")
@@ -62,7 +65,30 @@ async def add_card_to_deck(deck_id: str, data: DeckCardCreate, user_id: str = De
 
 @router.patch("/cards/{card_id}")
 async def update_deck_card_quantity(card_id: str, data: DeckCardUpdateQuantity, user_id: str = Depends(get_current_user_id)):
-    ok = await DeckService.update_card_quantity(card_id, user_id, data.quantity)
+    ok = await DeckService.update_card_quantity(
+        card_id,
+        user_id,
+        data.quantity,
+        data.setCode,
+        set_code_provided="setCode" in data.model_fields_set,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Carta no encontrada en el mazo")
+    return {"status": "success"}
+
+@router.patch("/cards/{card_id}/version")
+async def update_deck_card_version(
+    card_id: str,
+    data: DeckCardUpdateVersion,
+    user_id: str = Depends(get_current_user_id)
+):
+    ok = await DeckService.update_card_version(
+        card_id=card_id,
+        user_id=user_id,
+        card_scryfall_id=data.cardScryfallId,
+        image_uri=data.imageUri,
+        set_code=data.setCode,
+    )
     if not ok:
         raise HTTPException(status_code=404, detail="Carta no encontrada en el mazo")
     return {"status": "success"}

@@ -1,8 +1,12 @@
 import httpx
 import logging
+import os
+from datetime import datetime, timezone
+from prisma import Json
 from typing import List, Dict, Any, Optional
 from src.core.db import db
-from src.services.card_utils import normalize_card_name
+from src.services.card_utils import normalize_card_name, is_playable_card
+from src.services.image_resolver import safe_image_uri, strip_scryfall_image_uris
 
 logger = logging.getLogger("mtg_backend.scryfall")
 
@@ -11,13 +15,118 @@ SCRYFALL_HEADERS = {
     "User-Agent": "MTGUtils/2.0 (FastAPI-Python-Backend)",
     "Accept": "application/json;q=0.9,*/*;q=0.8",
 }
+WORKER_URL = os.getenv("WORKER_URL", "http://worker:8001").rstrip("/")
 
 class ScryfallService:
+    @staticmethod
+    async def get_catalog_card(name: str) -> Optional[Dict[str, Any]]:
+        """Returns a card from the local catalog without contacting Scryfall."""
+        norm = normalize_card_name(name)
+        if not norm:
+            return None
+
+        existing = await db.cardcatalog.find_unique(where={"normalizedName": norm})
+        if not existing:
+            return None
+
+        # The worker hydrates full localized details into the detailsEs blob,
+        # which carries the English oracle text too. Use it to decide commander
+        # eligibility server-side without a live Scryfall round-trip.
+        oracle_text: Optional[str] = None
+        details = getattr(existing, "detailsEs", None)
+        if isinstance(details, dict):
+            oracle_text = details.get("oracle_text") or details.get("oracleText")
+
+        return {
+            "id": existing.id,
+            "name": existing.name,
+            "normalizedName": existing.normalizedName,
+            "manaCost": existing.manaCost,
+            "typeLine": existing.typeLine,
+            "imageUri": safe_image_uri(existing.imageUri),
+            "setCode": existing.setCode,
+            "collectorNumber": existing.collectorNumber,
+            "oracleText": oracle_text,
+            "nameEs": getattr(existing, "nameEs", None),
+            "typeLineEs": getattr(existing, "typeLineEs", None),
+            "oracleTextEs": getattr(existing, "oracleTextEs", None),
+            "flavorTextEs": getattr(existing, "flavorTextEs", None),
+        }
+
+    @staticmethod
+    async def search_cards_local(query: str, limit: int = 15) -> List[Dict[str, Any]]:
+        """
+        Searches the local CardCatalog database first. Returns Scryfall-shaped
+        card results for any name that contains the query (case-insensitive).
+        """
+        if not query or not query.strip() or limit <= 0:
+            return []
+
+        try:
+            records = await db.cardcatalog.find_many(
+                where={
+                    "name": {"contains": query.strip(), "mode": "insensitive"}
+                },
+                take=limit,
+                order={"name": "asc"},
+            )
+        except Exception as e:
+            logger.error(f"Error searching local card catalog: {e}")
+            return []
+
+        printings_by_catalog: Dict[str, Any] = {}
+        if records:
+            try:
+                printings = await db.cardprinting.find_many(
+                    where={"catalogId": {"in": [record.id for record in records]}},
+                    order={"releasedAt": "desc"},
+                )
+                for printing in printings:
+                    printings_by_catalog.setdefault(printing.catalogId, printing)
+            except Exception:
+                logger.warning("Could not resolve local image variants for search results", exc_info=True)
+
+        results: List[Dict[str, Any]] = []
+        for record in records:
+            image_uris: Dict[str, str] = {}
+            printing = printings_by_catalog.get(record.id)
+            normal = safe_image_uri(getattr(printing, "imageUri", None)) or safe_image_uri(record.imageUri)
+            small = safe_image_uri(getattr(printing, "imageUriSmall", None)) or normal
+            large = safe_image_uri(getattr(printing, "imageUriLarge", None)) or normal
+            if normal:
+                image_uris = {
+                    "small": small,
+                    "normal": normal,
+                    "large": large,
+                    "art_crop": normal,
+                }
+            results.append({
+                "id": record.id,
+                "name": record.name,
+                "mana_cost": record.manaCost,
+                "type_line": record.typeLine,
+                "set": record.setCode,
+                "collector_number": record.collectorNumber,
+                "image_uris": image_uris,
+            })
+        return results
+
     @staticmethod
     async def search_cards(query: str, page: int = 1) -> Dict[str, Any]:
         if not query or not query.strip():
             return {"total_cards": 0, "has_more": False, "data": []}
 
+        # Database-first: hit the local CardCatalog cache before Scryfall.
+        local_results = await ScryfallService.search_cards_local(query.strip())
+        if local_results:
+            return {
+                "total_cards": len(local_results),
+                "has_more": False,
+                "data": local_results,
+                "source": "local",
+            }
+
+        # Fallback to the live Scryfall API when nothing matches locally.
         async with httpx.AsyncClient(headers=SCRYFALL_HEADERS, timeout=10.0) as client:
             try:
                 res = await client.get(f"{SCRYFALL_BASE}/cards/search", params={"q": query.strip(), "page": page})
@@ -25,19 +134,42 @@ class ScryfallService:
                     return {"total_cards": 0, "has_more": False, "data": []}
                 res.raise_for_status()
                 data = res.json()
+                clean_cards = [c for c in data.get("data", []) if is_playable_card(c)]
                 return {
-                    "total_cards": data.get("total_cards", 0),
+                    "total_cards": len(clean_cards) if len(clean_cards) != len(data.get("data", [])) else data.get("total_cards", 0),
                     "has_more": bool(data.get("has_more", False)),
-                    "data": data.get("data", []),
+                    "data": strip_scryfall_image_uris(clean_cards),
                 }
             except Exception as e:
                 logger.error(f"Error searching cards on Scryfall: {e}")
                 return {"total_cards": 0, "has_more": False, "data": []}
 
     @staticmethod
+    async def autocomplete_local(query: str, limit: int = 10) -> List[str]:
+        """Names matching the query from the local CardCatalog."""
+        if not query or len(query.strip()) < 2 or limit <= 0:
+            return []
+        try:
+            records = await db.cardcatalog.find_many(
+                where={
+                    "name": {"contains": query.strip(), "mode": "insensitive"}
+                },
+                take=limit,
+                order={"name": "asc"},
+            )
+            return [r.name for r in records]
+        except Exception as e:
+            logger.error(f"Error autocompleting from local catalog: {e}")
+            return []
+
+    @staticmethod
     async def autocomplete_cards(query: str) -> List[str]:
         if not query or len(query.strip()) < 2:
             return []
+
+        local_names = await ScryfallService.autocomplete_local(query.strip())
+        if local_names:
+            return local_names
 
         async with httpx.AsyncClient(headers=SCRYFALL_HEADERS, timeout=5.0) as client:
             try:
@@ -61,7 +193,10 @@ class ScryfallService:
                 res = await client.get(f"{SCRYFALL_BASE}/cards/named", params={param_key: name.strip()})
                 if res.status_code != 200:
                     return None
-                return res.json()
+                card_data = res.json()
+                if not is_playable_card(card_data):
+                    return None
+                return card_data
             except Exception as e:
                 logger.error(f"Error fetching card named '{name}': {e}")
                 return None
@@ -84,7 +219,7 @@ class ScryfallService:
                     res = await client.post(f"{SCRYFALL_BASE}/cards/collection", json={"identifiers": chunk})
                     if res.status_code == 200:
                         data = res.json()
-                        results.extend(data.get("data", []))
+                        results.extend([c for c in data.get("data", []) if is_playable_card(c)])
                 except Exception as e:
                     logger.error(f"Error in Scryfall bulk collection resolve: {e}")
 
@@ -99,23 +234,15 @@ class ScryfallService:
         if not norm:
             return None
 
-        # Check local catalog
-        existing = await db.cardcatalog.find_unique(where={"normalizedName": norm})
+        # Read the local catalog first. Only the worker's fallback below may
+        # contact Scryfall when the card is absent.
+        existing = await ScryfallService.get_catalog_card(name)
         if existing:
-            return {
-                "id": existing.id,
-                "name": existing.name,
-                "normalizedName": existing.normalizedName,
-                "manaCost": existing.manaCost,
-                "typeLine": existing.typeLine,
-                "imageUri": existing.imageUri,
-                "setCode": existing.setCode,
-                "collectorNumber": existing.collectorNumber,
-            }
+            return existing
 
         # Query Scryfall
         card_data = await ScryfallService.get_card_named(name, exact=False)
-        if not card_data:
+        if not card_data or not is_playable_card(card_data):
             return None
 
         card_id = card_data.get("id")
@@ -129,6 +256,7 @@ class ScryfallService:
             front = card_data["card_faces"][0]
             if "image_uris" in front and front["image_uris"]:
                 image_uri = front["image_uris"].get("normal")
+        image_uri = safe_image_uri(image_uri)
 
         created = await db.cardcatalog.upsert(
             where={"id": card_id},
@@ -241,6 +369,127 @@ class ScryfallService:
         return main_types
 
     @staticmethod
+    async def _get_cached_card_details(
+        card_id: Optional[str], name: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Reads an already-hydrated localized card detail from CardCatalog."""
+        try:
+            record = None
+            if card_id:
+                record = await db.cardcatalog.find_unique(where={"id": card_id})
+            elif name:
+                normalized_name = normalize_card_name(name)
+                if normalized_name:
+                    record = await db.cardcatalog.find_unique(
+                        where={"normalizedName": normalized_name}
+                    )
+            details = getattr(record, "detailsEs", None) if record else None
+            if isinstance(details, dict):
+                return details
+        except Exception as exc:
+            # A cache failure must not prevent the live fallback.
+            logger.warning("Unable to read card details cache: %s", exc)
+        return None
+
+    @staticmethod
+    async def _cache_card_details(details: Dict[str, Any]) -> None:
+        """Persists the complete localized response for future detail requests."""
+        card_id = details.get("id")
+        card_name = details.get("name")
+        normalized_name = normalize_card_name(card_name or "")
+        if not card_id or not card_name or not normalized_name:
+            return
+
+        image_uris = details.get("image_uris") or {}
+        image_uri = safe_image_uri(image_uris.get("normal") or image_uris.get("large"))
+        try:
+            await db.cardcatalog.upsert(
+                where={"id": card_id},
+                data={
+                    "create": {
+                        "id": card_id,
+                        "name": card_name,
+                        "normalizedName": normalized_name,
+                        "manaCost": details.get("mana_cost"),
+                        "typeLine": details.get("type_line"),
+                        "oracleTextEs": details.get("oracle_text_es"),
+                        "nameEs": details.get("name_es"),
+                        "typeLineEs": details.get("type_line_es"),
+                        "flavorTextEs": details.get("flavor_text_es"),
+                        "imageUri": image_uri,
+                        "setCode": details.get("set", "").lower() or None,
+                        "collectorNumber": details.get("collector_number"),
+                        "detailsEs": Json(details),
+                        "detailsUpdatedAt": datetime.now(timezone.utc),
+                    },
+                    "update": {
+                        "manaCost": details.get("mana_cost"),
+                        "typeLine": details.get("type_line"),
+                        "oracleTextEs": details.get("oracle_text_es"),
+                        "nameEs": details.get("name_es"),
+                        "typeLineEs": details.get("type_line_es"),
+                        "flavorTextEs": details.get("flavor_text_es"),
+                        "detailsEs": Json(details),
+                        "detailsUpdatedAt": datetime.now(timezone.utc),
+                    },
+                },
+            )
+        except Exception as exc:
+            # The live response remains valid even if persistence is unavailable.
+            logger.warning("Unable to cache card details for %s: %s", card_id, exc)
+
+    @staticmethod
+    def _finalize_cached_details(details: Dict[str, Any], key: Any) -> Dict[str, Any]:
+        """
+        Completes the stable Swift API contract on top of worker-produced
+        localized details that do not expose a translation flag.
+        """
+        details.setdefault("name_es", details.get("name", ""))
+        details.setdefault("rarity_es", details.get("rarity", ""))
+        details.setdefault("has_spanish_print", False)
+        details.setdefault("cmc", None)
+        details.setdefault("prices", None)
+        legalities = details.get("legalities")
+        if isinstance(legalities, dict):
+            details["legalities"] = [
+                {
+                    "format": fmt,
+                    "format_name": fmt.replace("_", " ").title(),
+                    "status": value,
+                    "status_es": value,
+                }
+                for fmt, value in legalities.items()
+            ]
+        return details
+
+    @staticmethod
+    async def enrich_card_via_worker(
+        card_id: Optional[str], name: Optional[str]
+    ) -> Optional[str]:
+        """
+        Asks the worker to hydrate a missing card fully (Scryfall data,
+        images, prices and rulings) and blocks until it completes. Returns the
+        catalog id when the card was enriched, else None.
+        """
+        payload: Dict[str, str] = {}
+        if card_id:
+            payload["id"] = card_id
+        if name:
+            payload["name"] = name
+        if not payload:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                res = await client.post(f"{WORKER_URL}/enrich-card", json=payload)
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get("status") == "enriched":
+                        return (data.get("card") or {}).get("id") or (card_id or "")
+        except Exception as exc:
+            logger.warning("Worker on-demand enrichment unavailable: %s", exc)
+        return None
+
+    @staticmethod
     async def get_card_details_es(
         card_id: Optional[str] = None,
         name: Optional[str] = None,
@@ -248,8 +497,33 @@ class ScryfallService:
         collector_number: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Fetches complete card data with official Spanish print resolution and localization.
+        Fetches complete card data with official Spanish print resolution and
+        localization. When the card is missing from the database, delegates the
+        full hydration (Scryfall data, images, prices and rulings) to the worker
+        and waits for it to finish. Only falls back to a direct Scryfall call
+        when the worker is unreachable.
         """
+        cached = await ScryfallService._get_cached_card_details(card_id, name)
+        stale_cached = cached
+        if cached and cached.get("cache_version") == 2:
+            logger.info("Card details cache hit for %s", card_id or name)
+            return ScryfallService._finalize_cached_details(cached, card_id or name)
+
+        # Card not in the database: delegate full hydration to the worker.
+        enriched_id = await ScryfallService.enrich_card_via_worker(card_id, name)
+        if enriched_id:
+            cached = await ScryfallService._get_cached_card_details(enriched_id, name)
+            if cached:
+                logger.info(
+                    "Card details hydrated on-demand by the worker for %s",
+                    card_id or name,
+                )
+                return ScryfallService._finalize_cached_details(cached, enriched_id)
+
+        if stale_cached:
+            logger.warning("Returning stale card details after enrichment failed for %s", card_id or name)
+            return ScryfallService._finalize_cached_details(stale_cached, card_id or name)
+
         async with httpx.AsyncClient(headers=SCRYFALL_HEADERS, timeout=12.0) as client:
             card_data: Optional[Dict[str, Any]] = None
 
@@ -316,7 +590,6 @@ class ScryfallService:
                         logger.error(f"Error searching Spanish print for {c_name}: {e}")
 
             # 3. Extract Spanish and English values
-            has_spanish_print = es_card is not None
             name_es = None
             type_line_es = None
             oracle_text_es = None
@@ -429,7 +702,7 @@ class ScryfallService:
 
             prices = card_data.get("prices", {})
 
-            return {
+            details = {
                 "id": card_data.get("id"),
                 "name": card_data.get("name"),
                 "name_es": name_es,
@@ -451,7 +724,6 @@ class ScryfallService:
                 "set_name": card_data.get("set_name"),
                 "collector_number": card_data.get("collector_number"),
                 "artist": card_data.get("artist"),
-                "has_spanish_print": has_spanish_print,
                 "image_uris": image_uris,
                 "card_faces": card_faces,
                 "legalities": legalities_es,
@@ -462,4 +734,5 @@ class ScryfallService:
                     "usd_foil": prices.get("usd_foil"),
                 },
             }
-
+            await ScryfallService._cache_card_details(details)
+            return details

@@ -4,6 +4,8 @@ from src.core.db import db
 from src.schemas.collection import CollectionCardCreate, CollectionCardResponse, CollectionStats
 from src.services.scryfall_service import ScryfallService
 from src.services.import_service import parse_decklist_text
+from src.services.enrichment_service import trigger_async_priority_enrichment
+from src.services.image_resolver import resolve_minio_image_uris, safe_image_uri
 
 logger = logging.getLogger("mtg_backend.collection")
 
@@ -12,18 +14,29 @@ class CollectionService:
     async def get_user_collection(
         user_id: str,
         query: Optional[str] = None,
-        limit: int = 100,
+        limit: Optional[int] = None,
         offset: int = 0
     ) -> List[CollectionCardResponse]:
         where_clause: Dict[str, Any] = {"userId": user_id}
         if query and query.strip():
             where_clause["cardName"] = {"contains": query.strip(), "mode": "insensitive"}
 
-        cards = await db.collectioncard.find_many(
-            where=where_clause,
-            take=limit,
-            skip=offset,
-            order={"updatedAt": "desc"}
+        find_args: Dict[str, Any] = {
+            "where": where_clause,
+            "order": [{"cardName": "asc"}, {"id": "asc"}],
+        }
+        if limit is not None:
+            find_args["take"] = limit
+        if offset > 0:
+            find_args["skip"] = offset
+
+        cards = await db.collectioncard.find_many(**find_args)
+
+        # Resolve local (MinIO) image URLs from card_printings; Scryfall URLs
+        # are fetched server-side by next/image and fail, so we prefer the
+        # locally-mirrored image when available.
+        local_images = await resolve_minio_image_uris(
+            [c.cardScryfallId for c in cards]
         )
 
         return [
@@ -33,39 +46,46 @@ class CollectionService:
                 cardScryfallId=c.cardScryfallId,
                 cardName=c.cardName,
                 quantity=c.quantity,
+                isFoil=getattr(c, "isFoil", False),
                 setCode=c.setCode,
                 collectorNumber=c.collectorNumber,
                 manaCost=c.manaCost,
                 typeLine=c.typeLine,
-                imageUri=c.imageUri,
+                imageUri=local_images.get(c.cardScryfallId) or safe_image_uri(c.imageUri),
                 updatedAt=c.updatedAt,
             )
             for c in cards
         ]
 
     @staticmethod
-    async def add_or_increment_card(user_id: str, data: CollectionCardCreate) -> CollectionCardResponse:
+    async def add_or_increment_card(
+        user_id: str,
+        data: CollectionCardCreate,
+        *,
+        prioritize: bool = True,
+    ) -> CollectionCardResponse:
         # Check if already in collection
         existing = await db.collectioncard.find_unique(
-            where={"userId_cardScryfallId": {"userId": user_id, "cardScryfallId": data.cardScryfallId}}
+            where={"userId_cardScryfallId": {"userId": user_id, "cardScryfallId": data.cardScryfallId, "isFoil": data.isFoil}}
         )
 
         if existing:
             updated = await db.collectioncard.update(
                 where={"id": existing.id},
-                data={"quantity": existing.quantity + data.quantity}
+                data={"quantity": {"increment": data.quantity}}
             )
             c = updated
         else:
-            # If metadata missing, resolve from catalog or Scryfall
+            # Keep creation responsive: only read the local catalog here. A
+            # missing card is resolved remotely by the priority worker.
             mana_cost = data.manaCost
             type_line = data.typeLine
-            image_uri = data.imageUri
+            image_uri = safe_image_uri(data.imageUri)
             set_code = data.setCode
             collector_num = data.collectorNumber
 
             if not type_line or not image_uri:
-                cat = await ScryfallService.get_or_resolve_catalog_card(data.cardName)
+                cat = await ScryfallService.get_catalog_card(data.cardName)
                 if cat:
                     mana_cost = mana_cost or cat.get("manaCost")
                     type_line = type_line or cat.get("typeLine")
@@ -76,6 +96,7 @@ class CollectionService:
             created = await db.collectioncard.create(
                 data={
                     "userId": user_id,
+                    "isFoil": data.isFoil,
                     "cardScryfallId": data.cardScryfallId,
                     "cardName": data.cardName,
                     "quantity": data.quantity,
@@ -88,22 +109,36 @@ class CollectionService:
             )
             c = created
 
+        # Every user-driven add is sent to the priority worker, including
+        # existing rows whose metadata may still be incomplete. Imports batch
+        # their names and schedule one worker run after all rows are stored.
+        if prioritize:
+            trigger_async_priority_enrichment([data.cardName])
+
         return CollectionCardResponse(
             id=c.id,
             userId=c.userId,
             cardScryfallId=c.cardScryfallId,
             cardName=c.cardName,
             quantity=c.quantity,
+                isFoil=getattr(c, "isFoil", False),
             setCode=c.setCode,
             collectorNumber=c.collectorNumber,
             manaCost=c.manaCost,
             typeLine=c.typeLine,
-            imageUri=c.imageUri,
+            imageUri=safe_image_uri(c.imageUri),
             updatedAt=c.updatedAt,
         )
 
     @staticmethod
-    async def update_quantity(user_id: str, card_id: str, quantity: int) -> Optional[CollectionCardResponse]:
+    async def update_quantity(
+        user_id: str,
+        card_id: str,
+        quantity: int,
+        set_code: Optional[str] = None,
+        *,
+        set_code_provided: bool = False,
+    ) -> Optional[CollectionCardResponse]:
         card = await db.collectioncard.find_unique(where={"id": card_id})
         if not card or card.userId != user_id:
             return None
@@ -112,9 +147,12 @@ class CollectionService:
             await db.collectioncard.delete(where={"id": card_id})
             return None
 
+        update_data: Dict[str, Any] = {"quantity": quantity}
+        if set_code_provided:
+            update_data["setCode"] = set_code or None
         updated = await db.collectioncard.update(
             where={"id": card_id},
-            data={"quantity": quantity}
+            data=update_data
         )
         return CollectionCardResponse(
             id=updated.id,
@@ -122,11 +160,12 @@ class CollectionService:
             cardScryfallId=updated.cardScryfallId,
             cardName=updated.cardName,
             quantity=updated.quantity,
+            isFoil=getattr(updated, "isFoil", False),
             setCode=updated.setCode,
             collectorNumber=updated.collectorNumber,
             manaCost=updated.manaCost,
             typeLine=updated.typeLine,
-            imageUri=updated.imageUri,
+            imageUri=safe_image_uri(updated.imageUri),
             updatedAt=updated.updatedAt,
         )
 
@@ -150,24 +189,6 @@ class CollectionService:
         )
 
     @staticmethod
-    async def import_collection_text(user_id: str, raw_text: str) -> Dict[str, Any]:
-        parsed = parse_decklist_text(raw_text)
-        imported_count = 0
-
-        for item in parsed:
-            cat = await ScryfallService.get_or_resolve_catalog_card(item.name)
-            scryfall_id = cat.get("id") if cat else f"pending:{item.name}"
-            card_create = CollectionCardCreate(
-                cardScryfallId=scryfall_id,
-                cardName=item.name,
-                quantity=item.quantity,
-                setCode=item.setCode or (cat.get("setCode") if cat else None),
-                collectorNumber=item.collectorNumber or (cat.get("collectorNumber") if cat else None),
-                manaCost=cat.get("manaCost") if cat else None,
-                typeLine=cat.get("typeLine") if cat else None,
-                imageUri=cat.get("imageUri") if cat else None,
-            )
-            await CollectionService.add_or_increment_card(user_id, card_create)
-            imported_count += item.quantity
-
-        return {"status": "success", "importedCount": imported_count, "uniqueCards": len(parsed)}
+    async def import_collection_text(user_id: str, raw_text: str, request_key: Optional[str] = None) -> Dict[str, Any]:
+        from src.services.bulk_import import import_text
+        return await import_text(db, user_id, raw_text, request_key)

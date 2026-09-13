@@ -29,4 +29,5 @@ class ImportMoxfieldRequest(BaseModel):
     format: Optional[str] = "Commander"
 
 class ImportCollectionTextRequest(BaseModel):
-    text: str
+    text: str = Field(..., max_length=2_000_000)
+    requestKey: Optional[str] = Field(default=None, min_length=1, max_length=128)

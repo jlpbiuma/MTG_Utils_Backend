@@ -22,6 +22,9 @@ class SetCommanderRequest(BaseModel):
     commander: str
     commanderScryfallId: Optional[str] = None
     commanderImageUri: Optional[str] = None
+    partner: Optional[str] = None
+    partnerScryfallId: Optional[str] = None
+    partnerImageUri: Optional[str] = None
 
 class DeckCardCreate(BaseModel):
     cardScryfallId: str
@@ -32,9 +35,16 @@ class DeckCardCreate(BaseModel):
     manaCost: Optional[str] = None
     typeLine: Optional[str] = None
     imageUri: Optional[str] = None
+    setCode: Optional[str] = None
 
 class DeckCardUpdateQuantity(BaseModel):
     quantity: int = Field(..., ge=1)
+    setCode: Optional[str] = None
+
+class DeckCardUpdateVersion(BaseModel):
+    cardScryfallId: str
+    imageUri: Optional[str] = None
+    setCode: Optional[str] = None
 
 class DeckCardAssign(BaseModel):
     quantity: int = Field(default=1, ge=1)
@@ -51,6 +61,11 @@ class OtherDeckAssignment(BaseModel):
     deckName: str
     quantity: int
 
+class DeckRequirement(BaseModel):
+    deckId: str
+    deckName: str
+    quantity: int
+
 class DeckCardWithOwnership(BaseModel):
     id: str
     deckId: str
@@ -63,10 +78,14 @@ class DeckCardWithOwnership(BaseModel):
     manaCost: Optional[str] = None
     typeLine: Optional[str] = None
     imageUri: Optional[str] = None
+    setCode: Optional[str] = None
     ownedInCollection: int
     availableToAssign: int
     assignedInOtherDecks: List[OtherDeckAssignment] = []
+    requestedInDecks: List[DeckRequirement] = []
+    requestedInDecksCount: int = 0
     missingCount: int
+    canBeCommander: bool = False
 
 class DeckSummaryResponse(BaseModel):
     id: str
@@ -84,6 +103,13 @@ class DeckSummaryResponse(BaseModel):
     ownedCards: int
     missingCards: int
     completionPercentage: float
+    colors: List[str] = []
+    colorIdentity: str = ""
+    totalValue: Optional[float] = None
+    missingValue: Optional[float] = None
+    ownedValue: Optional[float] = None
+    currency: str = "EUR"
+    currencySymbol: str = "€"
 
 class DeckDetailResponse(BaseModel):
     id: str
@@ -101,4 +127,9 @@ class DeckDetailResponse(BaseModel):
     ownedCards: int
     missingCards: int
     completionPercentage: float
+    totalValue: Optional[float] = None
+    missingValue: Optional[float] = None
+    ownedValue: Optional[float] = None
+    currency: str = "EUR"
+    currencySymbol: str = "€"
     cards: List[DeckCardWithOwnership] = []

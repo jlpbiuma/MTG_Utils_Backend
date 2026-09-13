@@ -12,7 +12,7 @@ router = APIRouter(prefix="/collection", tags=["collection"])
 @router.get("", response_model=List[CollectionCardResponse])
 async def get_collection(
     query: Optional[str] = Query(None),
-    limit: int = Query(100, ge=1, le=500),
+    limit: Optional[int] = Query(None, ge=1),
     offset: int = Query(0, ge=0),
     user_id: str = Depends(get_current_user_id)
 ):
@@ -28,7 +28,13 @@ async def update_collection_quantity(
     data: CollectionCardUpdate,
     user_id: str = Depends(get_current_user_id)
 ):
-    res = await CollectionService.update_quantity(user_id, card_id, data.quantity)
+    res = await CollectionService.update_quantity(
+        user_id,
+        card_id,
+        data.quantity,
+        data.setCode,
+        set_code_provided="setCode" in data.model_fields_set,
+    )
     return res
 
 @router.delete("/{card_id}")

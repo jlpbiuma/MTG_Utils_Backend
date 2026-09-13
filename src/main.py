@@ -4,9 +4,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from src.core.config import settings
 from src.core.db import connect_db, disconnect_db
-from src.routers import decks, collection, scryfall, edhrec, pricing, import_cards, worker
+from src.routers import decks, collection, scryfall, edhrec, pricing, import_cards, worker, catalog
 
 logging.basicConfig(level=logging.INFO)
+# Silence internal Prisma engine and HTTP transport logs to prevent terminal spam
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("mtg_backend")
 
 @asynccontextmanager
@@ -54,6 +57,7 @@ app.include_router(edhrec.router, prefix="/api")
 app.include_router(pricing.router, prefix="/api")
 app.include_router(import_cards.router, prefix="/api")
 app.include_router(worker.router, prefix="/api")
+app.include_router(catalog.router, prefix="/api")
 
 @app.get("/api/health")
 async def health_check():

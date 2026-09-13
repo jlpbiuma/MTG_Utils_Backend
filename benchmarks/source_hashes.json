@@ -1,0 +1,8 @@
+{
+  "backend/benchmarks/bulk_import.py": "66fc0b4de98a710b259b262a7a41c2da538377db796582dc70db2dca0ce05f19",
+  "backend/benchmarks/bulk_catalog.py": "5506eaf7937ef02a5a86fec1ecbe6e5464ace6d3579d97739177cfdc72690bf3",
+  "worker/benchmarks/bulk_priority.py": "eef9f9b83e07fdcab07ac1f345997e3554511c777edcd06a99bce9ba89132978",
+  "backend/src/services/collection_service.py": "81ff03260d4f139d01ffb2b5aa8a6ae0f4d23a339df8029e76d330b989a53de5",
+  "worker/src/services/scryfall.py": "f550d501e460ac6dd1ce0ebe7eb4666a5b4e3df43d53c14a81ddb5759f016152",
+  "worker/src/worker.py": "d46bf687153c7b62979cfe7eded8e7bbb41e217bce90eb4fa302c071c6549d46"
+}

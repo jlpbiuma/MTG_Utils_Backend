@@ -12,6 +12,34 @@ from src.services.collection_service import CollectionService
 
 router = APIRouter(prefix="/import", tags=["import"])
 
+
+async def _fetch_moxfield_deck(mox_id: str) -> dict:
+    """Fetch a public Moxfield deck, tolerating the API version in use."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://www.moxfield.com/",
+    }
+    endpoints = (
+        f"https://api2.moxfield.com/v3/decks/all/{mox_id}",
+        f"https://api2.moxfield.com/v2/decks/all/{mox_id}",
+    )
+    async with httpx.AsyncClient(headers=headers, timeout=20.0, follow_redirects=True) as client:
+        last_status = None
+        try:
+            for api_url in endpoints:
+                res = await client.get(api_url)
+                last_status = res.status_code
+                if res.status_code == 200:
+                    payload = res.json()
+                    if isinstance(payload, dict) and any(payload.get(key) for key in ("mainboard", "commanders", "sideboard")):
+                        return payload
+                if res.status_code not in (400, 403, 404, 405, 429, 500, 502, 503, 504):
+                    res.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=400, detail=f"Error conectando con Moxfield: {exc}") from exc
+    raise HTTPException(status_code=400, detail=f"Moxfield no permitió obtener el mazo (HTTP {last_status})")
+
 @router.post("/parse", response_model=ParsedDecklist)
 async def parse_text(data: ParseTextRequest):
     return parse_decklist(data.text)
@@ -29,7 +57,7 @@ async def import_deck_text(data: ImportDeckTextRequest, user_id: str = Depends(g
 
 @router.post("/collection")
 async def import_collection_text(data: ImportCollectionTextRequest, user_id: str = Depends(get_current_user_id)):
-    return await CollectionService.import_collection_text(user_id=user_id, raw_text=data.text)
+    return await CollectionService.import_collection_text(user_id=user_id, raw_text=data.text, request_key=data.requestKey)
 
 @router.post("/moxfield")
 async def import_moxfield_deck(data: ImportMoxfieldRequest, user_id: str = Depends(get_current_user_id)):
@@ -41,16 +69,7 @@ async def import_moxfield_deck(data: ImportMoxfieldRequest, user_id: str = Depen
         raise HTTPException(status_code=400, detail="URL de Moxfield inválida")
 
     mox_id = match.group(1)
-    api_url = f"https://api2.moxfield.com/v3/decks/all/{mox_id}"
-
-    async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}, timeout=12.0) as client:
-        try:
-            res = await client.get(api_url)
-            if res.status_code != 200:
-                raise HTTPException(status_code=400, detail="No se pudo obtener el mazo desde Moxfield")
-            deck_data = res.json()
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error conectando con Moxfield: {str(e)}")
+    deck_data = await _fetch_moxfield_deck(mox_id)
 
     name = deck_data.get("name", "Moxfield Deck")
     format_name = data.format or deck_data.get("format", "Commander")
@@ -93,3 +112,15 @@ async def import_moxfield_deck(data: ImportMoxfieldRequest, user_id: str = Depen
         commander=commander_name
     )
     return deck
+
+@router.get("/collection/{import_id}")
+async def get_collection_import(import_id: str, user_id: str = Depends(get_current_user_id)):
+    from src.core.db import db
+    from src.services.bulk_import import import_status
+    return await import_status(db, user_id, import_id)
+
+@router.post("/collection/{import_id}/retry")
+async def retry_collection_import(import_id: str, user_id: str = Depends(get_current_user_id)):
+    from src.core.db import db
+    from src.services.bulk_import import retry_import
+    return await retry_import(db, user_id, import_id)
