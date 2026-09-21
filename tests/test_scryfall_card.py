@@ -232,9 +232,6 @@ async def test_card_endpoint_joins_printings_by_catalog_id():
         priceCardmarketTrend=1.5,
         priceCardmarketMin=1.0,
         priceCardmarketMax=2.0,
-        priceCardtraderTrend=None,
-        priceCardtraderMin=None,
-        priceCardtraderMax=None,
     )
     printing.releasedAt = SimpleNamespace(isoformat=lambda: "2021-04-23T00:00:00+00:00")
     ruling = SimpleNamespace(

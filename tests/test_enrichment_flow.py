@@ -45,6 +45,7 @@ async def test_worker_resolution_falls_back_to_scryfall_and_caches_missing_card(
     created.id = "remote-sol-ring"
     mock_db = MagicMock()
     mock_db.cardcatalog.find_unique = AsyncMock(return_value=None)
+    mock_db.cardcatalog.find_first = AsyncMock(return_value=None)
     mock_db.cardcatalog.upsert = AsyncMock(return_value=created)
     remote_card = {
         "id": "remote-sol-ring",
@@ -62,7 +63,7 @@ async def test_worker_resolution_falls_back_to_scryfall_and_caches_missing_card(
         card = await ScryfallService.get_or_resolve_catalog_card("Sol Ring")
 
     assert card["id"] == "remote-sol-ring"
-    get_card_named.assert_awaited_once_with("Sol Ring", exact=False)
+    get_card_named.assert_awaited_once_with("Sol Ring", exact=True)
     mock_db.cardcatalog.upsert.assert_awaited_once()
 
 

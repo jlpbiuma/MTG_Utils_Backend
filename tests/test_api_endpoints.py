@@ -43,3 +43,23 @@ async def test_cors_local_network_192_168_0_x():
         assert response.status_code == 200
         assert response.headers.get("access-control-allow-origin") == "http://192.168.0.45:3000"
 
+
+@pytest.mark.asyncio
+async def test_deck_add_missing_endpoints():
+    from unittest.mock import patch, AsyncMock
+    transport = ASGITransport(app=app)
+    
+    with patch("src.services.deck_service.DeckService.add_missing_card_to_collection", new_callable=AsyncMock, return_value={"status": "success", "addedCount": 1}), \
+         patch("src.services.deck_service.DeckService.add_missing_cards_to_collection", new_callable=AsyncMock, return_value={"status": "success", "addedCount": 5}):
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            # Single card
+            res_single = await ac.post("/api/decks/cards/c-123/add-missing", headers={"X-User-Id": "u-1"})
+            assert res_single.status_code == 200
+            assert res_single.json()["addedCount"] == 1
+
+            # Bulk deck
+            res_bulk = await ac.post("/api/decks/d-123/add-missing", headers={"X-User-Id": "u-1"})
+            assert res_bulk.status_code == 200
+            assert res_bulk.json()["addedCount"] == 5
+
+

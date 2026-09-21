@@ -52,6 +52,8 @@ def test_is_basic_land_by_type_line():
     assert is_basic_land("Basic Land — Island") is True
     assert is_basic_land("Basic Land — Snow-Covered Forest") is True
     assert is_basic_land("Basic Land — Wastes") is True
+    assert is_basic_land("Tierra básica — Bosque") is True
+    assert is_basic_land("Tierra basica — Pantano") is True
     assert is_basic_land("Land — Island") is False
     assert is_basic_land("Creature — Merfolk") is False
     assert is_basic_land(None) is False
@@ -60,7 +62,10 @@ def test_is_basic_land_by_type_line():
 def test_is_basic_land_by_name():
     for name in ["Plains", "Island", "Swamp", "Mountain", "Forest",
                  "Wastes", "Snow-Covered Plains", "Snow-Covered Island",
-                 "Snow-Covered Swamp", "Snow-Covered Mountain", "Snow-Covered Forest"]:
+                 "Snow-Covered Swamp", "Snow-Covered Mountain", "Snow-Covered Forest",
+                 "Bosque", "Bosques", "Isla", "Islas", "Pantano", "Pantanos",
+                 "Montaña", "Montañas", "Montana", "Montanas", "Llanura", "Llanuras",
+                 "Yermo", "Yermos", "Bosque nevado", "Bosque cubierto de nieve"]:
         assert is_basic_land(None, name) is True
         assert is_basic_land("", name) is True
     assert is_basic_land(None, "Command Tower") is False

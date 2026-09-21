@@ -23,6 +23,33 @@ def make_fake_scryfall_client(response):
     return client_factory
 
 @pytest.mark.asyncio
+async def test_search_cards_finds_yshtola_ignoring_apostrophe():
+    """Typing 'yshtola' must hit the local catalog name 'Y'shtola, ...'."""
+    row = {
+        "id": "yshtola-1",
+        "name": "Y'shtola, Night's Blessed",
+        "mana_cost": "{2}{W}{U}{B}",
+        "type_line": "Legendary Creature — Cat Warlock",
+        "image_uri": "https://img/yshtola.webp",
+        "set_code": "fin",
+        "collector_number": "234",
+    }
+    mock_db = MagicMock()
+    mock_db.query_raw = AsyncMock(return_value=[row])
+    mock_db.cardprinting.find_many = AsyncMock(return_value=[])
+    httpx_mock = AsyncMock()
+
+    with patch("src.services.scryfall_service.db", mock_db), \
+         patch("src.services.scryfall_service.httpx.AsyncClient", httpx_mock):
+        result = await ScryfallService.search_cards("yshtola")
+
+    assert result["source"] == "local"
+    assert [card["name"] for card in result["data"]] == ["Y'shtola, Night's Blessed"]
+    httpx_mock.assert_not_called()
+    needle = mock_db.query_raw.await_args.args[1]
+    assert needle == "yshtola"
+
+@pytest.mark.asyncio
 async def test_search_cards_empty_query():
     result = await ScryfallService.search_cards("   ")
     assert result["total_cards"] == 0
@@ -31,7 +58,15 @@ async def test_search_cards_empty_query():
 @pytest.mark.asyncio
 async def test_search_cards_returns_local_results_without_scryfall():
     mock_db = MagicMock()
-    mock_db.cardcatalog.find_many = AsyncMock(return_value=[make_catalog_record()])
+    mock_db.query_raw = AsyncMock(return_value=[{
+        "id": "c1",
+        "name": "Sol Ring",
+        "mana_cost": "{1}",
+        "type_line": "Artifact",
+        "image_uri": "https://img/sol.png",
+        "set_code": "M20",
+        "collector_number": "252",
+    }])
     mock_db.cardprinting.find_many = AsyncMock(return_value=[MagicMock(
         catalogId="c1",
         imageUri="https://img/normal.webp",
@@ -60,7 +95,7 @@ async def test_search_cards_returns_local_results_without_scryfall():
 @pytest.mark.asyncio
 async def test_search_cards_falls_back_to_scryfall_when_db_empty():
     mock_db = MagicMock()
-    mock_db.cardcatalog.find_many = AsyncMock(return_value=[])
+    mock_db.query_raw = AsyncMock(return_value=[])
 
     fake_card = {
         "id": "scry-1",
@@ -92,7 +127,7 @@ async def test_search_cards_falls_back_to_scryfall_when_db_empty():
 @pytest.mark.asyncio
 async def test_search_cards_empty_when_db_and_scryfall_miss():
     mock_db = MagicMock()
-    mock_db.cardcatalog.find_many = AsyncMock(return_value=[])
+    mock_db.query_raw = AsyncMock(return_value=[])
 
     fake_response = MagicMock()
     fake_response.status_code = 404
@@ -107,9 +142,10 @@ async def test_search_cards_empty_when_db_and_scryfall_miss():
 @pytest.mark.asyncio
 async def test_autocomplete_cards_local_first():
     mock_db = MagicMock()
-    record_a = make_catalog_record(id="c-a", name="Lightning Bolt")
-    record_b = make_catalog_record(id="c-b", name="Lightning Helix")
-    mock_db.cardcatalog.find_many = AsyncMock(return_value=[record_a, record_b])
+    mock_db.query_raw = AsyncMock(return_value=[
+        {"id": "c-a", "name": "Lightning Bolt"},
+        {"id": "c-b", "name": "Lightning Helix"},
+    ])
 
     httpx_mock = AsyncMock()
     with patch("src.services.scryfall_service.db", mock_db), \

@@ -27,9 +27,6 @@ def make_mock_printing(scry_id: str, name: str, trend: float):
     p.priceCardmarketTrend = trend
     p.priceCardmarketMin = trend * 0.9
     p.priceCardmarketMax = trend * 1.2
-    p.priceCardtraderTrend = None
-    p.priceCardtraderMin = None
-    p.priceCardtraderMax = None
     p.pricesUpdatedAt = datetime.now()
     p.catalog = MagicMock()
     p.catalog.normalizedName = name.lower()

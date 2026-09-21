@@ -363,9 +363,9 @@ async def test_get_user_decks_excludes_basic_lands_from_completion():
 
     assert len(decks) == 1
     summary = decks[0]
-    # 30 Basics excluded from the denominator and numerator
-    assert summary.totalCards == 2
-    assert summary.ownedCards == 2
+    # 30 Basics are automatically owned, so 100% completion with 0 missing cards
+    assert summary.totalCards == 32
+    assert summary.ownedCards == 32
     assert summary.missingCards == 0
     assert summary.completionPercentage == 100
 
@@ -418,9 +418,9 @@ async def test_get_deck_detail_excludes_basic_lands_from_completion():
         detail = await DeckService.get_deck_detail("deck-1", "user-1")
 
     assert detail is not None
-    # The 25 Mountains are excluded from completion and never "missing"
-    assert detail.totalCards == 1
-    assert detail.ownedCards == 0
+    # The 25 Mountains are in totalCards (26 total cards in deck), but never "missing"
+    assert detail.totalCards == 26
+    assert detail.ownedCards == 25
     assert detail.missingCards == 1
 
     by_name = {c.cardName: c for c in detail.cards}
@@ -654,4 +654,103 @@ async def test_get_deck_detail_reports_requested_in_decks():
 
     # Current deck comes first
     assert signet.requestedInDecks[0].deckId == "deck-tidus"
+
+
+@pytest.mark.asyncio
+async def test_add_missing_card_to_collection_single():
+    # Card in deck that is missing
+    mock_deck = MagicMock()
+    mock_deck.id = "deck-1"
+    mock_deck.userId = "user-1"
+
+    mock_card = MagicMock(
+        id="card-sol-ring",
+        deckId="deck-1",
+        cardScryfallId="sol-ring-id",
+        cardName="Sol Ring",
+        quantity=1,
+        assignedQuantity=0,
+        manaCost="{1}",
+        typeLine="Artifact",
+        imageUri="https://example.com/solring.jpg",
+        deck=mock_deck,
+    )
+
+    mock_db = MagicMock()
+    mock_db.deckcard.find_unique = AsyncMock(return_value=mock_card)
+    mock_db.deckcard.update = AsyncMock()
+    mock_db.collectioncard.find_unique = AsyncMock(return_value=None)
+    mock_db.collectioncard.find_first = AsyncMock(return_value=None)
+    mock_db.collectioncard.create = AsyncMock()
+
+    # Mock get_deck_detail returning missingCount = 1
+    mock_detail_card = MagicMock(id="card-sol-ring", missingCount=1)
+    mock_detail = MagicMock(cards=[mock_detail_card])
+
+    with patch("src.services.deck_service.db", mock_db), \
+         patch("src.services.deck_service.DeckService.get_deck_detail", new_callable=AsyncMock, return_value=mock_detail):
+        result = await DeckService.add_missing_card_to_collection("card-sol-ring", "user-1")
+
+    assert result["status"] == "success"
+    assert result["addedCount"] == 1
+
+    # Should have created collection card
+    mock_db.collectioncard.create.assert_called_once()
+    create_args = mock_db.collectioncard.create.call_args[1]["data"]
+    assert create_args["cardName"] == "Sol Ring"
+    assert create_args["quantity"] == 1
+
+    # Should have assigned card to deck
+    mock_db.deckcard.update.assert_called_once_with(
+        where={"id": "card-sol-ring"},
+        data={"assignedQuantity": 1}
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_missing_cards_to_collection_bulk():
+    mock_card1 = MagicMock(
+        id="c1",
+        cardScryfallId="id-1",
+        cardName="Arcane Signet",
+        missingCount=1,
+        assignedQuantity=0,
+        quantity=1,
+        manaCost="{2}",
+        typeLine="Artifact",
+        imageUri="https://example.com/signet.jpg",
+    )
+    mock_card2 = MagicMock(
+        id="c2",
+        cardScryfallId="id-2",
+        cardName="Sol Ring",
+        missingCount=2,
+        assignedQuantity=0,
+        quantity=2,
+        manaCost="{1}",
+        typeLine="Artifact",
+        imageUri="https://example.com/ring.jpg",
+    )
+    mock_detail = MagicMock(cards=[mock_card1, mock_card2])
+
+    mock_db = MagicMock()
+    mock_db.collectioncard.find_unique = AsyncMock(return_value=None)
+    mock_db.collectioncard.find_first = AsyncMock(return_value=None)
+    mock_db.collectioncard.create = AsyncMock()
+    mock_db.deckcard.update = AsyncMock()
+
+    with patch("src.services.deck_service.db", mock_db), \
+         patch("src.services.deck_service.DeckService.get_deck_detail", new_callable=AsyncMock, return_value=mock_detail):
+        result = await DeckService.add_missing_cards_to_collection("deck-test", "user-1")
+
+    assert result["status"] == "success"
+    assert result["addedCount"] == 3  # 1 + 2
+
+    # Should have created collection cards for both
+    assert mock_db.collectioncard.create.call_count == 2
+    # Should have updated assignedQuantity for both deck cards
+    assert mock_db.deckcard.update.call_count == 2
+    mock_db.deckcard.update.assert_any_call(where={"id": "c1"}, data={"assignedQuantity": 1})
+    mock_db.deckcard.update.assert_any_call(where={"id": "c2"}, data={"assignedQuantity": 2})
+
 
