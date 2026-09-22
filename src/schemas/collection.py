@@ -2,6 +2,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
 from src.schemas.deck import DeckRequirement
+from src.schemas.pricing import PriceSummary
 
 class CollectionCardCreate(BaseModel):
     cardScryfallId: str
@@ -92,3 +93,8 @@ class DormantCardsResponse(BaseModel):
     activeCommanders: List[str] = []
     cards: List[DormantCardItem] = []
 
+
+class CollectionViewResponse(BaseModel):
+    """Local collection rows and cached unit prices needed by the native screen."""
+    cards: List[CollectionCardResponse]
+    priceSummary: PriceSummary

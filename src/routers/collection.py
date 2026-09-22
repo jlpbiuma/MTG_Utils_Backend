@@ -7,6 +7,9 @@ from src.schemas.collection import (
     DormantCardsResponse,
 )
 from src.services.collection_service import CollectionService
+from src.services.collection_view_service import CollectionViewService
+from src.schemas.collection import CollectionViewResponse
+from src.schemas.pricing import PriceProvider
 
 router = APIRouter(prefix="/collection", tags=["collection"])
 
@@ -18,6 +21,13 @@ async def get_collection(
     user_id: str = Depends(get_current_user_id)
 ):
     return await CollectionService.get_user_collection(user_id, query, limit, offset)
+
+@router.get("/view", response_model=CollectionViewResponse)
+async def get_collection_view(
+    provider: PriceProvider = "cardmarket",
+    user_id: str = Depends(get_current_user_id),
+):
+    return await CollectionViewService.get_view(user_id, provider)
 
 @router.get("/query", response_model=CollectionQueryResponse)
 async def get_collection_query(

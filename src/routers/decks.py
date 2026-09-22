@@ -9,6 +9,10 @@ from src.schemas.deck import (
 )
 from src.services.deck_service import DeckService
 
+from src.schemas.deck_view import DeckViewResponse
+from src.schemas.pricing import PriceProvider
+from src.services.deck_view_service import DeckViewService
+
 router = APIRouter(prefix="/decks", tags=["decks"])
 
 @router.get("", response_model=List[DeckSummaryResponse])
@@ -22,6 +26,17 @@ async def create_deck(data: DeckCreate, user_id: str = Depends(get_current_user_
 @router.get("/overlap")
 async def get_decks_overlap(user_id: str = Depends(get_current_user_id)):
     return await DeckService.get_decks_overlap(user_id)
+
+@router.get("/{deck_id}/view", response_model=DeckViewResponse)
+async def get_deck_view(
+    deck_id: str,
+    provider: PriceProvider = "cardmarket",
+    user_id: str = Depends(get_current_user_id),
+):
+    view = await DeckViewService.get_view(deck_id, user_id, provider)
+    if view is None:
+        raise HTTPException(status_code=404, detail="Mazo no encontrado")
+    return view
 
 @router.get("/{deck_id}", response_model=DeckDetailResponse)
 async def get_deck(deck_id: str, user_id: str = Depends(get_current_user_id)):
