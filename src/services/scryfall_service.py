@@ -24,17 +24,21 @@ WORKER_URL = os.getenv("WORKER_URL", "http://worker:8001").rstrip("/")
 _SEARCH_TRANSLATE_FROM = "áéíóúüñàèìòùâêîôûäëïöüç''’"
 _SEARCH_TRANSLATE_TO = "aeiouunaeiouaeiouaeiouc"
 _CATALOG_SEARCH_SQL = f"""
+WITH searchable AS (
+    SELECT id, name, mana_cost, type_line, image_uri, set_code, collector_number,
+           regexp_replace(translate(lower(name), '{_SEARCH_TRANSLATE_FROM}', '{_SEARCH_TRANSLATE_TO}'),
+                          '[^a-z0-9]+', '', 'g') AS search_name,
+           regexp_replace(translate(lower(coalesce(name_es, '')), '{_SEARCH_TRANSLATE_FROM}', '{_SEARCH_TRANSLATE_TO}'),
+                          '[^a-z0-9]+', '', 'g') AS search_name_es
+    FROM card_catalog
+)
 SELECT id, name, mana_cost, type_line, image_uri, set_code, collector_number
-FROM card_catalog
-WHERE regexp_replace(
-        translate(lower(name), '{_SEARCH_TRANSLATE_FROM}', '{_SEARCH_TRANSLATE_TO}'),
-        '[^a-z0-9]+', '', 'g'
-      ) LIKE '%' || $1 || '%'
-   OR regexp_replace(
-        translate(lower(coalesce(name_es, '')), '{_SEARCH_TRANSLATE_FROM}', '{_SEARCH_TRANSLATE_TO}'),
-        '[^a-z0-9]+', '', 'g'
-      ) LIKE '%' || $1 || '%'
-ORDER BY name ASC
+FROM searchable
+WHERE search_name LIKE '%' || $1 || '%' OR search_name_es LIKE '%' || $1 || '%'
+ORDER BY CASE
+    WHEN search_name = $1 OR search_name_es = $1 THEN 0
+    WHEN search_name LIKE $1 || '%' OR search_name_es LIKE $1 || '%' THEN 1
+    ELSE 2 END, name ASC
 LIMIT $2
 """
 
@@ -174,7 +178,7 @@ class ScryfallService:
 
         # Database-first: hit the local CardCatalog cache before Scryfall.
         local_results = await ScryfallService.search_cards_local(query.strip())
-        if local_results:
+        if local_results and any(fold_search_text(c["name"]).startswith(fold_search_text(query)) for c in local_results):
             return {
                 "total_cards": len(local_results),
                 "has_more": False,
@@ -187,10 +191,14 @@ class ScryfallService:
             try:
                 res = await client.get(f"{SCRYFALL_BASE}/cards/search", params={"q": query.strip(), "page": page})
                 if res.status_code == 404:
-                    return {"total_cards": 0, "has_more": False, "data": []}
+                    return {"total_cards": len(local_results), "has_more": False, "data": local_results}
                 res.raise_for_status()
                 data = res.json()
                 clean_cards = [c for c in data.get("data", []) if is_playable_card(c)]
+                seen = {normalize_card_name(c["name"]) for c in clean_cards}
+                clean_cards.extend(c for c in local_results if normalize_card_name(c["name"]) not in seen)
+                needle = fold_search_text(query)
+                clean_cards.sort(key=lambda c: (not fold_search_text(c["name"]).startswith(needle), c["name"]))
                 return {
                     "total_cards": len(clean_cards) if len(clean_cards) != len(data.get("data", [])) else data.get("total_cards", 0),
                     "has_more": bool(data.get("has_more", False)),
@@ -198,7 +206,7 @@ class ScryfallService:
                 }
             except Exception as e:
                 logger.error(f"Error searching cards on Scryfall: {e}")
-                return {"total_cards": 0, "has_more": False, "data": []}
+                return {"total_cards": len(local_results), "has_more": False, "data": local_results}
 
     @staticmethod
     async def autocomplete_local(query: str, limit: int = 10) -> List[str]:

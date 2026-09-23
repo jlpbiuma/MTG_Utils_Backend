@@ -216,23 +216,7 @@ class PriorityService:
             if unit_price <= 0.0 and "cheapestPrice" in g:
                 unit_price = g["cheapestPrice"]
 
-            # Fallback: if price is 0.0, find cheapest non-zero print in database
-            if unit_price <= 0.0:
-                cheapest_p = await db.cardprinting.find_first(
-                    where={
-                        "catalog": {"normalizedName": norm},
-                        "OR": [
-                            {"priceCardmarketTrend": {"gt": 0.0}},
-                            {"priceEur": {"gt": 0.0}},
-                        ],
-                    },
-                    order={"priceCardmarketTrend": "asc"},
-                )
-                if cheapest_p:
-                    unit_price = cheapest_p.priceCardmarketTrend or cheapest_p.priceEur or 0.0
-                    g["cardScryfallId"] = cheapest_p.id
-                    if cheapest_p.imageUri or cheapest_p.imageUriLarge:
-                        g["imageUri"] = safe_image_uri(cheapest_p.imageUri or cheapest_p.imageUriLarge)
+
 
             card_scryfall_id = g["cardScryfallId"]
             if quote and quote.scryfallId:

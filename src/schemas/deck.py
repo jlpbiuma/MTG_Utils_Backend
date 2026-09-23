@@ -117,6 +117,8 @@ class DeckSummaryResponse(BaseModel):
     commanderImageUri: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
     isArchived: bool = False
+    isCommanderTop100: bool = False
+    commanderEdhrecRank: Optional[int] = None
     createdAt: datetime
     updatedAt: datetime
     totalCards: int
@@ -143,6 +145,8 @@ class DeckDetailResponse(BaseModel):
     commanderImageUri: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
     isArchived: bool = False
+    isCommanderTop100: bool = False
+    commanderEdhrecRank: Optional[int] = None
     createdAt: datetime
     updatedAt: datetime
     totalCards: int

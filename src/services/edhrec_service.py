@@ -5,8 +5,20 @@ import time
 import logging
 from typing import List, Dict, Any, Optional
 from src.core.db import db
-from src.services.card_utils import normalize_card_name, completion_percentages_by_deck, colors_by_deck
-from src.schemas.edhrec import EdhrecCardRecommendation
+import math
+from src.schemas.edhrec import (
+    EdhrecCardRecommendation,
+    CommanderTypeBreakdown,
+    CommanderTypeOwnership,
+    CommanderRecommendationSummary,
+    CommanderRecommendationsListResponse,
+)
+from src.services.card_utils import (
+    normalize_card_name,
+    is_basic_land,
+    completion_percentages_by_deck,
+    colors_by_deck,
+)
 
 logger = logging.getLogger("mtg_backend.edhrec")
 
@@ -251,5 +263,198 @@ class EdhrecService:
             ),
             categories=edhrec_data.get("categories", []),
             recommendations=recommendations,
+        )
+
+    @staticmethod
+    async def get_commander_recommendations_for_user(
+        user_id: str,
+        search: Optional[str] = None,
+        colors: Optional[str] = None,
+        top100_only: bool = False,
+        owned_commander_only: bool = False,
+        sort_by: str = "completion",
+        page: int = 1,
+        page_size: int = 24,
+    ) -> CommanderRecommendationsListResponse:
+        # Load user collection
+        collection_cards = await db.collectioncard.find_many(where={"userId": user_id})
+        user_collection_names = {
+            normalize_card_name(c.cardName)
+            for c in (collection_cards or [])
+            if (c.quantity or 0) > 0 and c.cardName
+        }
+
+        # Include archived decks and every explicitly marked commander (partners too).
+        decks = await db.deck.find_many(where={"userId": user_id})
+        commander_cards = await db.deckcard.find_many(
+            where={"deck": {"userId": user_id}, "isCommander": True}
+        )
+        existing_commanders = {
+            normalize_card_name(d.commander) for d in decks if d.commander
+        } | {
+            normalize_card_name(c.cardName) for c in commander_cards if c.cardName
+        }
+
+        # Pending/failed downloads cannot provide meaningful completion values.
+        where_filter: Dict[str, Any] = {"status": "synced"}
+        if top100_only:
+            where_filter["isTop100"] = True
+
+        db_commanders = await db.edhreccommander.find_many(
+            where=where_filter,
+            order=[{"isTop100": "desc"}, {"rank": "asc"}, {"name": "asc"}],
+        )
+
+        target_colors = None
+        if colors:
+            target_colors = set(c.upper() for c in colors.replace(",", " ").split() if c)
+
+        search_term = search.strip().lower() if search else None
+
+        summaries: List[CommanderRecommendationSummary] = []
+        commanders_by_slug = {}
+        for cmd in db_commanders:
+            cmd_norm = cmd.normalizedName or normalize_card_name(cmd.name)
+            if normalize_card_name(cmd_norm) in existing_commanders:
+                continue
+            user_owns_cmd = cmd_norm in user_collection_names
+
+            if owned_commander_only and not user_owns_cmd:
+                continue
+
+            if search_term and search_term not in cmd.name.lower():
+                continue
+
+            cmd_colors = [c.upper() for c in (cmd.colorIdentity or "") if c.upper() in "WUBRG"]
+            if target_colors is not None:
+                if not set(cmd_colors).issubset(target_colors):
+                    continue
+
+            # Type breakdown
+            tb = CommanderTypeBreakdown(
+                creatures=cmd.creatureCount,
+                instants=cmd.instantCount,
+                sorceries=cmd.sorceryCount,
+                artifacts=cmd.artifactCount,
+                enchantments=cmd.enchantmentCount,
+                battle=cmd.battleCount,
+                planeswalkers=cmd.planeswalkerCount,
+                lands=cmd.landCount,
+                basicLands=cmd.basicLandCount,
+                nonbasicLands=cmd.nonbasicLandCount,
+            )
+
+            cards_json = cmd.cardsJson if isinstance(cmd.cardsJson, dict) else {}
+            canonical_names = cmd.canonicalCardNames if isinstance(cmd.canonicalCardNames, list) else []
+
+            from src.services.edhrec_deck_service import CATEGORIES, select_recommended_cards, group_coverage
+            commanders_by_slug[cmd.slug] = cmd
+            selected_cards, _ = select_recommended_cards(cmd, user_collection_names)
+
+            def calc_type_ownership(tags: List[str], quota: int) -> tuple[int, int]:
+                type_line = next(t for category_tags, _, t in CATEGORIES if category_tags == tags)
+                owned = sum(
+                    1 for norm, _, selected_type in selected_cards
+                    if selected_type == type_line and norm in user_collection_names
+                )
+                return owned, max(0, quota)
+
+            if cards_json:
+                cr_owned, cr_total = calc_type_ownership(["creatures"], cmd.creatureCount)
+                in_owned, in_total = calc_type_ownership(["instants"], cmd.instantCount)
+                so_owned, so_total = calc_type_ownership(["sorceries"], cmd.sorceryCount)
+                ar_owned, ar_total = calc_type_ownership(["utilityartifacts", "manaartifacts", "artifacts"], cmd.artifactCount)
+                en_owned, en_total = calc_type_ownership(["enchantments"], cmd.enchantmentCount)
+                pw_owned, pw_total = calc_type_ownership(["planeswalkers"], cmd.planeswalkerCount)
+                ld_owned, ld_total = calc_type_ownership(["utilitylands", "lands"], cmd.nonbasicLandCount)
+
+                battle_owned, battle_total = calc_type_ownership(["battles"], cmd.battleCount)
+
+                total_owned = battle_owned + cr_owned + in_owned + so_owned + ar_owned + en_owned + pw_owned + ld_owned
+                total_req = battle_total + cr_total + in_total + so_total + ar_total + en_total + pw_total + ld_total
+            else:
+                cr_owned = in_owned = so_owned = ar_owned = en_owned = pw_owned = ld_owned = 0
+                cr_total = in_total = so_total = ar_total = en_total = pw_total = ld_total = 0
+                total_req = len(canonical_names)
+                total_owned = sum(1 for c in canonical_names if c in user_collection_names)
+
+            ownership = CommanderTypeOwnership(
+                creaturesOwned=cr_owned,
+                creaturesTotal=cr_total,
+                instantsOwned=in_owned,
+                instantsTotal=in_total,
+                sorceriesOwned=so_owned,
+                sorceriesTotal=so_total,
+                artifactsOwned=ar_owned,
+                artifactsTotal=ar_total,
+                enchantmentsOwned=en_owned,
+                enchantmentsTotal=en_total,
+                planeswalkersOwned=pw_owned,
+                planeswalkersTotal=pw_total,
+                nonbasicLandsOwned=ld_owned,
+                nonbasicLandsTotal=ld_total,
+            )
+
+            pct = round((total_owned / total_req) * 100, 1) if total_req > 0 else 0.0
+
+            img_uri = get_edhrec_card_image_url(cmd.id)
+
+            summaries.append(CommanderRecommendationSummary(
+                id=str(cmd.id or ""),
+                name=str(cmd.name or ""),
+                normalizedName=str(cmd_norm or ""),
+                slug=str(cmd.slug or ""),
+                imageUri=img_uri,
+                colorIdentity=cmd_colors,
+                isTop100=bool(cmd.isTop100),
+                edhrecRank=cmd.rank,
+                numDecks=int(cmd.numDecks or 0),
+                typeBreakdown=tb,
+                typeOwnership=ownership,
+                completionPercentage=pct,
+                ownedCardsCount=total_owned,
+                totalRequiredCards=total_req,
+                userOwnsCommander=user_owns_cmd,
+                highSynergyCoverage=group_coverage(cmd, "highsynergycards", user_collection_names),
+                topCardsCoverage=group_coverage(cmd, "topcards", user_collection_names),
+            ))
+
+        if sort_by == "rank":
+            summaries.sort(key=lambda s: (0 if s.edhrecRank else 1, s.edhrecRank or 9999, -s.completionPercentage))
+        elif sort_by == "name":
+            summaries.sort(key=lambda s: s.name.lower())
+        else: # "completion"
+            summaries.sort(key=lambda s: (-s.completionPercentage, 0 if s.edhrecRank else 1, s.edhrecRank or 9999, -s.numDecks))
+
+        total_items = len(summaries)
+        page_size = max(1, min(page_size, 100))
+        page = max(1, page)
+        total_pages = math.ceil(total_items / page_size) if total_items > 0 else 1
+
+        start_idx = (page - 1) * page_size
+        paged_items = summaries[start_idx : start_idx + page_size]
+
+        # Price only the visible page, using one batch for all its selected cards.
+        from src.services.edhrec_deck_service import recommendation_prices, estimate_values, with_commander_for_pricing
+        selections, candidates = {}, {}
+        for summary in paged_items:
+            selected, required = select_recommended_cards(commanders_by_slug[summary.slug], user_collection_names)
+            selected = with_commander_for_pricing(commanders_by_slug[summary.slug], selected)
+            selections[summary.slug] = (selected, required + 1)
+            candidates.update({norm: card for norm, card, _ in selected})
+        quotes = {}
+        if candidates:
+            quotes, _ = await recommendation_prices(candidates, collection_cards, db)
+        for summary in paged_items:
+            selected, required = selections[summary.slug]
+            for field, value in estimate_values(selected, required, user_collection_names, quotes).items():
+                setattr(summary, field, value)
+
+        return CommanderRecommendationsListResponse(
+            total=total_items,
+            page=page,
+            pageSize=page_size,
+            totalPages=total_pages,
+            commanders=paged_items,
         )
 

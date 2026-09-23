@@ -124,6 +124,17 @@ class DeckService:
             q = batch_quotes.get(cid) or batch_quotes.get(norm)
             price_memo[cid] = q.unitPrice.trend if q else None
 
+        # Resolve EDHREC Top 100 commanders to badge any user decks using them
+        try:
+            top100_commanders = await db.edhreccommander.find_many(where={"isTop100": True})
+            top100_map: Dict[str, int] = {
+                c.normalizedName: c.rank
+                for c in (top100_commanders or [])
+                if c.normalizedName and c.rank is not None
+            }
+        except Exception:
+            top100_map = {}
+
         summaries: List[DeckSummaryResponse] = []
         for d in decks:
             cards = d.cards or []
@@ -163,6 +174,10 @@ class DeckService:
             pct = round((owned / total) * 100, 1) if total > 0 else 0.0
             colors = combine_colors_from_mana_costs([c.manaCost for c in cards])
 
+            cmd_norm = normalize_card_name(d.commander) if d.commander else ""
+            is_top100 = cmd_norm in top100_map if cmd_norm else False
+            top100_rank = top100_map.get(cmd_norm) if is_top100 else None
+
             summaries.append(DeckSummaryResponse(
                 id=d.id,
                 userId=d.userId,
@@ -174,6 +189,8 @@ class DeckService:
                 commanderImageUri=safe_image_uri(d.commanderImageUri),
                 tags=[t.strip() for t in (d.tags or "").split(",") if t.strip()],
                 isArchived=getattr(d, "isArchived", False),
+                isCommanderTop100=is_top100,
+                commanderEdhrecRank=top100_rank,
                 createdAt=d.createdAt,
                 updatedAt=d.updatedAt,
                 totalCards=total,
@@ -398,6 +415,17 @@ class DeckService:
         miss_val = round(missing_value, 2) if missing_value else None
         own_val = round(net_val - miss_val, 2) if (net_val is not None and miss_val is not None) else (round(owned_value, 2) if owned_value else None)
 
+        is_top100 = False
+        top100_rank = None
+        if deck.commander:
+            try:
+                top_cmd = await db.edhreccommander.find_unique(where={"normalizedName": normalize_card_name(deck.commander)})
+                if top_cmd and top_cmd.isTop100:
+                    is_top100 = True
+                    top100_rank = top_cmd.rank
+            except Exception:
+                pass
+
         return DeckDetailResponse(
             id=deck.id,
             userId=deck.userId,
@@ -409,6 +437,8 @@ class DeckService:
             commanderImageUri=safe_image_uri(deck.commanderImageUri),
             tags=[t.strip() for t in (deck.tags or "").split(",") if t.strip()],
             isArchived=getattr(deck, "isArchived", False),
+            isCommanderTop100=is_top100,
+            commanderEdhrecRank=top100_rank,
             createdAt=deck.createdAt,
             updatedAt=deck.updatedAt,
             totalCards=total,
