@@ -1,5 +1,6 @@
 import re
 import logging
+from types import SimpleNamespace
 from typing import List, Dict, Any, Optional
 from src.core.db import db
 from src.schemas.deck import (
@@ -103,14 +104,28 @@ class DeckService:
                 {"name": c.cardName, "scryfallId": c.cardScryfallId, "quantity": c.quantity}
                 for c in (d.cards or [])
             )
+            if d.commander:
+                cmd_in_cards = any(
+                    c.isCommander or normalize_card_name(c.cardName) == normalize_card_name(d.commander)
+                    for c in (d.cards or [])
+                )
+                if not cmd_in_cards:
+                    all_cards.append({
+                        "name": d.commander,
+                        "scryfallId": d.commanderScryfallId,
+                        "quantity": 1,
+                    })
+
         price_memo: Dict[str, Optional[float]] = {}
         unique_cards = []
-        seen_ids = set()
+        seen_keys = set()
         for card in all_cards:
             card_id = card.get("scryfallId") or ""
-            if not card_id or card_id in seen_ids:
+            norm = normalize_card_name(card.get("name") or "")
+            key = card_id or norm
+            if not key or key in seen_keys:
                 continue
-            seen_ids.add(card_id)
+            seen_keys.add(key)
             unique_cards.append(card)
 
         batch_quotes = await PricingService.get_latest_quotes_batch(
@@ -122,7 +137,11 @@ class DeckService:
             cid = card.get("scryfallId") or ""
             norm = normalize_card_name(card.get("name", ""))
             q = batch_quotes.get(cid) or batch_quotes.get(norm)
-            price_memo[cid] = q.unitPrice.trend if q else None
+            price = q.unitPrice.trend if q else None
+            if cid:
+                price_memo[cid] = price
+            if norm:
+                price_memo[norm] = price
 
         # Resolve EDHREC Top 100 commanders to badge any user decks using them
         try:
@@ -137,7 +156,24 @@ class DeckService:
 
         summaries: List[DeckSummaryResponse] = []
         for d in decks:
-            cards = d.cards or []
+            cards = list(d.cards or [])
+            has_cmd = any(
+                c.isCommander or (d.commander and normalize_card_name(c.cardName) == normalize_card_name(d.commander))
+                for c in cards
+            )
+            if d.commander and not has_cmd:
+                cards.append(SimpleNamespace(
+                    id=f"cmd:{d.id}",
+                    cardName=d.commander,
+                    cardScryfallId=d.commanderScryfallId,
+                    quantity=1,
+                    assignedQuantity=0,
+                    isSideboard=False,
+                    isCommander=True,
+                    manaCost=None,
+                    typeLine="Legendary Creature",
+                ))
+
             unique = len(cards)
 
             # Calculate owned. Basic lands never count toward completion:
@@ -149,7 +185,7 @@ class DeckService:
             missing_value = 0.0
             owned_value = 0.0
             for c in cards:
-                if c.isSideboard:
+                if c.isSideboard and not getattr(c, "isCommander", False):
                     continue
 
                 norm = normalize_card_name(c.cardName)
@@ -159,13 +195,13 @@ class DeckService:
                     actual_owned = c.quantity
                 else:
                     in_col = col_map.get(norm, 0)
-                    assigned = c.assignedQuantity or 0
+                    assigned = getattr(c, "assignedQuantity", 0) or 0
                     actual_owned = min(c.quantity, max(assigned, min(in_col, c.quantity)))
 
                 total += c.quantity
                 owned += actual_owned
 
-                unit = price_memo.get(c.cardScryfallId) or 0.0
+                unit = (price_memo.get(c.cardScryfallId) if c.cardScryfallId else None) or price_memo.get(norm) or 0.0
                 total_value += unit * c.quantity
                 missing_value += unit * (c.quantity - actual_owned)
                 owned_value += unit * actual_owned
@@ -225,13 +261,37 @@ class DeckService:
             norm = normalize_card_name(c.cardName)
             col_map[norm] = col_map.get(norm, 0) + (c.quantity or 0)
 
+        deck_cards = list(deck.cards or [])
+        has_cmd = any(
+            c.isCommander or (deck.commander and normalize_card_name(c.cardName) == normalize_card_name(deck.commander))
+            for c in deck_cards
+        )
+        if deck.commander and not has_cmd:
+            deck_cards.append(SimpleNamespace(
+                id=f"cmd:{deck.id}",
+                deckId=deck.id,
+                cardName=deck.commander,
+                cardScryfallId=deck.commanderScryfallId,
+                quantity=1,
+                assignedQuantity=0,
+                isSideboard=False,
+                isCommander=True,
+                manaCost=None,
+                typeLine="Legendary Creature",
+                imageUri=deck.commanderImageUri,
+                setCode=None,
+                tags=None,
+            ))
+
         # Prefer locally-mirrored (MinIO) images over upstream Scryfall URLs.
-        deck_card_ids = [c.cardScryfallId for c in (deck.cards or []) if c.cardScryfallId]
+        deck_card_ids = [c.cardScryfallId for c in deck_cards if c.cardScryfallId]
+        if deck.commanderScryfallId and deck.commanderScryfallId not in deck_card_ids:
+            deck_card_ids.append(deck.commanderScryfallId)
         local_images = await resolve_minio_image_uris(deck_card_ids)
 
         # Seed requested_in_decks with the current deck's cards
         decks_by_norm: Dict[str, Dict[str, DeckRequirement]] = {}
-        for c in (deck.cards or []):
+        for c in deck_cards:
             norm = normalize_card_name(c.cardName)
             if norm not in decks_by_norm:
                 decks_by_norm[norm] = {}
@@ -287,12 +347,14 @@ class DeckService:
         # Resolve market prices (DB only) for every unique card in this deck
         price_memo: Dict[str, Optional[float]] = {}
         unique_deck_cards = []
-        seen_ids = set()
-        for c in (deck.cards or []):
+        seen_keys = set()
+        for c in deck_cards:
             card_id = c.cardScryfallId or ""
-            if not card_id or card_id in seen_ids:
+            norm = normalize_card_name(c.cardName)
+            key = card_id or norm
+            if not key or key in seen_keys:
                 continue
-            seen_ids.add(card_id)
+            seen_keys.add(key)
             unique_deck_cards.append({"name": c.cardName, "scryfallId": card_id})
 
         try:
@@ -305,10 +367,18 @@ class DeckService:
                 cid = card["scryfallId"]
                 norm = normalize_card_name(card["name"])
                 q = batch_quotes.get(cid) or batch_quotes.get(norm)
-                price_memo[cid] = q.unitPrice.trend if q else None
+                val = q.unitPrice.trend if q else None
+                if cid:
+                    price_memo[cid] = val
+                if norm:
+                    price_memo[norm] = val
         except Exception:
             for card in unique_deck_cards:
-                price_memo[card["scryfallId"]] = None
+                if card["scryfallId"]:
+                    price_memo[card["scryfallId"]] = None
+                norm = normalize_card_name(card["name"])
+                if norm:
+                    price_memo[norm] = None
 
         cards_with_ownership: List[DeckCardWithOwnership] = []
         total = 0
@@ -317,7 +387,7 @@ class DeckService:
         missing_value = 0.0
         owned_value = 0.0
 
-        for c in (deck.cards or []):
+        for c in deck_cards:
             norm = normalize_card_name(c.cardName)
             col_qty = col_map.get(norm, 0)
             other_assigned_list = assigned_in_others.get(norm, [])
@@ -335,11 +405,11 @@ class DeckService:
                 actual_owned = min(c.quantity, max(c.assignedQuantity or 0, min(col_qty, c.quantity)))
                 missing = max(0, c.quantity - actual_owned)
 
-            if not c.isSideboard:
+            if not c.isSideboard or getattr(c, "isCommander", False):
                 total += c.quantity
                 owned += actual_owned
 
-            unit = price_memo.get(c.cardScryfallId) or 0.0
+            unit = (price_memo.get(c.cardScryfallId) if c.cardScryfallId else None) or price_memo.get(norm) or 0.0
 
             total_value += unit * c.quantity
             missing_value += unit * missing
@@ -360,14 +430,15 @@ class DeckService:
                         type_line = type_line or cat.get("typeLine")
                         mana_cost = mana_cost or cat.get("manaCost")
                         img_uri = img_uri or cat.get("imageUri")
-                        await db.deckcard.update(
-                            where={"id": c.id},
-                            data={
-                                "typeLine": type_line,
-                                "manaCost": mana_cost,
-                                "imageUri": img_uri,
-                            }
-                        )
+                        if not str(c.id).startswith("cmd:"):
+                            await db.deckcard.update(
+                                where={"id": c.id},
+                                data={
+                                    "typeLine": type_line,
+                                    "manaCost": mana_cost,
+                                    "imageUri": img_uri,
+                                }
+                            )
                 except Exception:
                     logger.warning(
                         "Could not enrich deck card %s (%s); returning stored values",

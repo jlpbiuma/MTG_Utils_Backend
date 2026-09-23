@@ -35,6 +35,8 @@ def database(cmd=None, collection=None, printings=None):
     db.collectioncard.find_many = AsyncMock(return_value=collection or [])
     db.cardcatalog.find_many = AsyncMock(return_value=[])
     db.cardprinting.find_many = AsyncMock(return_value=printings or [])
+    db.deckcard.find_many = AsyncMock(return_value=[])
+    db.wantcard.find_many = AsyncMock(return_value=[])
     return db
 
 
@@ -52,17 +54,17 @@ async def test_preview_prices_only_used_copies_of_owned_printing_and_finish(foil
         new_callable=AsyncMock, return_value={"popular elf": missing},
     ) as prices:
         detail = await get_recommended_deck("lathril", "user-a")
-    assert [c.cardName for c in detail.cards] == ["Popular Elf", "Other Elf", "Owned Elf"]
+    assert [c.cardName for c in detail.cards] == ["Popular Elf", "Other Elf", "Owned Elf", "Lathril"]
     assert detail.cards[2].ownedInCollection == 5
     assert detail.cards[2].quantity == 1
     assert detail.ownedValue == expected
     assert detail.missingValue == 3
     assert detail.totalValue == expected + 3
     assert detail.completionPercentage == 50
-    assert detail.unpricedCards == 0
+    assert detail.unpricedCards == 1
     db.collectioncard.find_many.assert_awaited_once_with(where={"userId": "user-a"})
     # Owned copies must never use a cheaper reprint's price.
-    prices.assert_awaited_once_with([{"name": "Popular Elf"}, {"name": "Other Elf"}], "cardmarket", "EUR")
+    prices.assert_awaited_once_with([{"name": "Popular Elf"}, {"name": "Other Elf"}, {"name": "Lathril"}], "cardmarket", "EUR")
     db.deck.create.assert_not_called()
     db.deckcard.create.assert_not_called()
 
@@ -75,7 +77,7 @@ async def test_unknown_prices_are_reported_and_short_lists_keep_required_slots()
         new_callable=AsyncMock, return_value={},
     ):
         detail = await get_recommended_deck("lathril", "user-a")
-    assert detail.unpricedCards == 3
+    assert detail.unpricedCards == 4
     assert detail.unfilledSlots == 1
     assert detail.ownedValue == 0
     assert detail.totalCards == 4
@@ -130,7 +132,7 @@ async def test_vivi_lists_all_creatures_and_merges_top_synergy_flags():
     assert len(creatures) == 8  # never truncate alternatives to the quota
     assert detail.typeQuotas["creatures"] == 2
     assert detail.typeQuotas["instants"] == 0
-    assert len(detail.cards) == 9
+    assert len(detail.cards) == 10
     featured = next(c for c in creatures if c.cardName == "Creature 6")
     assert featured.isTopCard and featured.isHighSynergy
     assert featured.inclusionPct == 84

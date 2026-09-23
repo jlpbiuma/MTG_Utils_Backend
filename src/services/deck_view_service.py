@@ -1,6 +1,7 @@
 """Local-only deck reads. Never resolve/enrich cards or write during a GET."""
 import json
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from src.core.db import db
 from src.schemas.deck import OtherDeckAssignment
 from src.schemas.deck_view import DeckViewCard, DeckViewResponse
@@ -22,7 +23,26 @@ class DeckViewService:
         )
         if deck is None:
             return None
-        cards = deck.cards or []
+        cards = list(deck.cards or [])
+        has_cmd = any(
+            c.isCommander or (deck.commander and normalize_card_name(c.cardName) == normalize_card_name(deck.commander))
+            for c in cards
+        )
+        if deck.commander and not has_cmd:
+            cards.append(SimpleNamespace(
+                id=f"cmd:{deck.id}",
+                deckId=deck.id,
+                cardName=deck.commander,
+                cardScryfallId=deck.commanderScryfallId,
+                quantity=1,
+                assignedQuantity=0,
+                isSideboard=False,
+                isCommander=True,
+                manaCost=None,
+                typeLine="Legendary Creature",
+                imageUri=deck.commanderImageUri,
+                setCode=None,
+            ))
         names = json.dumps(sorted({normalize_card_name(c.cardName) for c in cards}))
         collection = []
         assignments = []
@@ -66,7 +86,7 @@ class DeckViewService:
             basic = is_basic_land(card.typeLine, card.cardName)
             effective_owned = card.quantity if basic else min(card.quantity, max(card.assignedQuantity or 0, min(collection_qty, card.quantity)))
             missing = max(0, card.quantity - effective_owned)
-            if not card.isSideboard:
+            if not card.isSideboard or getattr(card, "isCommander", False):
                 total += card.quantity
                 owned += effective_owned
             quote = quotes.get(card.cardScryfallId) or quotes.get(norm)

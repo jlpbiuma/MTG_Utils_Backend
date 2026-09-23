@@ -303,9 +303,9 @@ async def test_get_deck_detail_missing_count_is_collection_aware():
     # Mana Crypt is genuinely missing
     assert by_name["Mana Crypt"].missingCount == 1
 
-    assert detail.totalCards == 6
+    assert detail.totalCards == 7
     assert detail.ownedCards == 5
-    assert detail.missingCards == 1
+    assert detail.missingCards == 2
 
 @pytest.mark.asyncio
 async def test_get_user_decks_excludes_basic_lands_from_completion():
@@ -353,9 +353,13 @@ async def test_get_user_decks_excludes_basic_lands_from_completion():
     col_sol.cardName = "Sol Ring"
     col_sol.quantity = 1
 
+    col_brago = MagicMock()
+    col_brago.cardName = "Brago, King Eternal"
+    col_brago.quantity = 1
+
     mock_db = MagicMock()
     mock_db.deck.find_many = AsyncMock(return_value=[deck])
-    mock_db.collectioncard.find_many = AsyncMock(return_value=[col_tower, col_sol])
+    mock_db.collectioncard.find_many = AsyncMock(return_value=[col_tower, col_sol, col_brago])
 
     with patch("src.services.deck_service.db", mock_db), \
          patch("src.services.deck_service.PricingService._latest_provider_quote", new_callable=AsyncMock, return_value=None):
@@ -363,9 +367,9 @@ async def test_get_user_decks_excludes_basic_lands_from_completion():
 
     assert len(decks) == 1
     summary = decks[0]
-    # 30 Basics are automatically owned, so 100% completion with 0 missing cards
-    assert summary.totalCards == 32
-    assert summary.ownedCards == 32
+    # 30 Basics are automatically owned, plus 3 non-basics/commander owned in collection -> 100% completion
+    assert summary.totalCards == 33
+    assert summary.ownedCards == 33
     assert summary.missingCards == 0
     assert summary.completionPercentage == 100
 
@@ -418,14 +422,15 @@ async def test_get_deck_detail_excludes_basic_lands_from_completion():
         detail = await DeckService.get_deck_detail("deck-1", "user-1")
 
     assert detail is not None
-    # The 25 Mountains are in totalCards (26 total cards in deck), but never "missing"
-    assert detail.totalCards == 26
+    # 25 Mountains + 1 Command Tower + 1 Purphoros (commander) = 27 total cards
+    assert detail.totalCards == 27
     assert detail.ownedCards == 25
-    assert detail.missingCards == 1
+    assert detail.missingCards == 2
 
     by_name = {c.cardName: c for c in detail.cards}
     assert by_name["Mountain"].missingCount == 0
     assert by_name["Command Tower"].missingCount == 1
+    assert by_name["Purphoros, God of the Forge"].missingCount == 1
 
 @pytest.mark.asyncio
 async def test_update_deck_name_and_commander():
@@ -640,9 +645,8 @@ async def test_get_deck_detail_reports_requested_in_decks():
         detail = await DeckService.get_deck_detail("deck-tidus", "user-1")
 
     assert detail is not None
-    assert len(detail.cards) == 1
-    signet = detail.cards[0]
-    assert signet.cardName == "Arcane Signet"
+    assert len(detail.cards) == 2
+    signet = next(c for c in detail.cards if c.cardName == "Arcane Signet")
     assert signet.missingCount == 1
 
     # Should report 3 decks requesting Arcane Signet: Tidus, Atraxa, Urza

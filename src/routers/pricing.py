@@ -29,7 +29,26 @@ async def get_prices(data: PricingRequest, user_id: str = Depends(get_current_us
         col_cards = await db.collectioncard.find_many(where={"userId": user_id})
         col_map = {normalize_card_name(c.cardName): c.quantity for c in col_cards}
 
-        for c in (deck.cards or []):
+        cards = list(deck.cards or [])
+        has_cmd = any(
+            c.isCommander or (deck.commander and normalize_card_name(c.cardName) == normalize_card_name(deck.commander))
+            for c in cards
+        )
+        if deck.commander and not has_cmd:
+            norm_cmd = normalize_card_name(deck.commander)
+            in_col = col_map.get(norm_cmd, 0)
+            actual_owned = min(1, in_col)
+            missing_qty = max(0, 1 - actual_owned)
+            cards_to_price.append({
+                "name": deck.commander,
+                "scryfallId": deck.commanderScryfallId,
+                "quantity": 1,
+                "ownedQuantity": actual_owned,
+                "missingQuantity": missing_qty,
+                "isMissing": (missing_qty > 0),
+            })
+
+        for c in cards:
             norm = normalize_card_name(c.cardName)
             in_col = col_map.get(norm, 0)
             assigned = c.assignedQuantity or 0

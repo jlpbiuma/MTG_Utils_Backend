@@ -29,7 +29,11 @@ WITH searchable AS (
            regexp_replace(translate(lower(name), '{_SEARCH_TRANSLATE_FROM}', '{_SEARCH_TRANSLATE_TO}'),
                           '[^a-z0-9]+', '', 'g') AS search_name,
            regexp_replace(translate(lower(coalesce(name_es, '')), '{_SEARCH_TRANSLATE_FROM}', '{_SEARCH_TRANSLATE_TO}'),
-                          '[^a-z0-9]+', '', 'g') AS search_name_es
+                          '[^a-z0-9]+', '', 'g') AS search_name_es,
+           regexp_replace(translate(lower(name), '{_SEARCH_TRANSLATE_FROM}', '{_SEARCH_TRANSLATE_TO}'),
+                          '[^a-z0-9]+', ' ', 'g') AS search_name_spaced,
+           regexp_replace(translate(lower(coalesce(name_es, '')), '{_SEARCH_TRANSLATE_FROM}', '{_SEARCH_TRANSLATE_TO}'),
+                          '[^a-z0-9]+', ' ', 'g') AS search_name_es_spaced
     FROM card_catalog
 )
 SELECT id, name, mana_cost, type_line, image_uri, set_code, collector_number
@@ -37,8 +41,11 @@ FROM searchable
 WHERE search_name LIKE '%' || $1 || '%' OR search_name_es LIKE '%' || $1 || '%'
 ORDER BY CASE
     WHEN search_name = $1 OR search_name_es = $1 THEN 0
-    WHEN search_name LIKE $1 || '%' OR search_name_es LIKE $1 || '%' THEN 1
-    ELSE 2 END, name ASC
+    WHEN search_name_spaced LIKE $1 || ' %' OR search_name_spaced LIKE $1 || 's %' OR search_name_spaced LIKE $1 || ' s %' THEN 1
+    WHEN search_name LIKE $1 || '%' THEN 2
+    WHEN search_name_spaced LIKE '% ' || $1 || ' %' OR search_name_spaced LIKE '% ' || $1 OR search_name_spaced LIKE '% ' || $1 || 's %' THEN 3
+    WHEN search_name_es_spaced LIKE $1 || ' %' OR search_name_es LIKE $1 || '%' THEN 4
+    ELSE 5 END, name ASC
 LIMIT $2
 """
 
@@ -51,6 +58,35 @@ def fold_search_text(value: Optional[str]) -> str:
     folded = "".join(ch for ch in folded if unicodedata.category(ch) != "Mn")
     folded = folded.lower().replace("'", "").replace("’", "").replace("`", "")
     return re.sub(r"[^a-z0-9]+", "", folded)
+
+
+def score_card_match(name: Optional[str], query: Optional[str]) -> int:
+    """Scores how well a card name matches the query. Lower is better."""
+    norm_name = fold_search_text(name)
+    norm_q = fold_search_text(query)
+    if not norm_name or not norm_q:
+        return 99
+    if norm_name == norm_q:
+        return 0
+
+    def _clean(val: Optional[str]) -> str:
+        s = unicodedata.normalize("NFD", (val or "").lower())
+        s = re.sub(r"['`’]", "", s)
+        s = re.sub(r"[^a-z0-9 ]+", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    clean_name = _clean(name)
+    clean_q = _clean(query)
+
+    if clean_name.startswith(f"{clean_q} ") or clean_name.startswith(f"{clean_q}s "):
+        return 1
+    if norm_name.startswith(norm_q):
+        return 2
+    if f" {clean_q} " in f" {clean_name} " or clean_name.endswith(f" {clean_q}"):
+        return 3
+    if norm_q in norm_name:
+        return 4
+    return 5
 
 
 def _field(row: Any, *names: str) -> Any:
@@ -178,7 +214,11 @@ class ScryfallService:
 
         # Database-first: hit the local CardCatalog cache before Scryfall.
         local_results = await ScryfallService.search_cards_local(query.strip())
-        if local_results and any(fold_search_text(c["name"]).startswith(fold_search_text(query)) for c in local_results):
+        local_results.sort(key=lambda c: (score_card_match(c.get("name"), query), c.get("name") or ""))
+
+        top_score = score_card_match(local_results[0].get("name"), query) if local_results else 99
+        # Return local directly if we have a top exact/word match
+        if local_results and top_score <= 1:
             return {
                 "total_cards": len(local_results),
                 "has_more": False,
@@ -186,7 +226,7 @@ class ScryfallService:
                 "source": "local",
             }
 
-        # Fallback to the live Scryfall API when nothing matches locally.
+        # Fallback to or supplement with live Scryfall API
         async with httpx.AsyncClient(headers=SCRYFALL_HEADERS, timeout=10.0) as client:
             try:
                 res = await client.get(f"{SCRYFALL_BASE}/cards/search", params={"q": query.strip(), "page": page})
@@ -197,8 +237,7 @@ class ScryfallService:
                 clean_cards = [c for c in data.get("data", []) if is_playable_card(c)]
                 seen = {normalize_card_name(c["name"]) for c in clean_cards}
                 clean_cards.extend(c for c in local_results if normalize_card_name(c["name"]) not in seen)
-                needle = fold_search_text(query)
-                clean_cards.sort(key=lambda c: (not fold_search_text(c["name"]).startswith(needle), c["name"]))
+                clean_cards.sort(key=lambda c: (score_card_match(c.get("name"), query), c.get("name") or ""))
                 return {
                     "total_cards": len(clean_cards) if len(clean_cards) != len(data.get("data", [])) else data.get("total_cards", 0),
                     "has_more": bool(data.get("has_more", False)),
@@ -243,12 +282,18 @@ class ScryfallService:
         async with httpx.AsyncClient(headers=SCRYFALL_HEADERS, timeout=8.0) as client:
             try:
                 res = await client.get(f"{SCRYFALL_BASE}/cards/named", params={param_key: name.strip()})
-                if res.status_code != 200:
-                    return None
-                card_data = res.json()
-                if not is_playable_card(card_data):
-                    return None
-                return card_data
+                if res.status_code == 200:
+                    card_data = res.json()
+                    if is_playable_card(card_data):
+                        return card_data
+                elif res.status_code == 404 and not exact:
+                    search_res = await client.get(f"{SCRYFALL_BASE}/cards/search", params={"q": name.strip()})
+                    if search_res.status_code == 200:
+                        search_data = search_res.json()
+                        playable = [c for c in search_data.get("data", []) if is_playable_card(c)]
+                        if playable:
+                            return playable[0]
+                return None
             except Exception as e:
                 logger.error(f"Error fetching card named '{name}': {e}")
                 return None

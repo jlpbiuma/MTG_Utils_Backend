@@ -198,11 +198,13 @@ class PricingService:
                         quote = entry["quote"]
 
                 if cached:
-                    if quote:
+                    if quote and getattr(quote, "unitPrice", None) and quote.unitPrice.trend > 0.0:
                         if cid:
                             results[cid] = quote
                         if norm:
                             results[norm] = quote
+                    else:
+                        cards_to_fetch.append(card)
                 else:
                     cards_to_fetch.append(card)
         else:
@@ -223,7 +225,10 @@ class PricingService:
         # 1. Fetch printings by ID
         printings_by_id: Dict[str, Any] = {}
         if valid_ids:
-            found = await db.cardprinting.find_many(where={"id": {"in": list(set(valid_ids))}})
+            found = await db.cardprinting.find_many(
+                where={"id": {"in": list(set(valid_ids))}},
+                include={"catalog": True},
+            )
             for p in found:
                 printings_by_id[p.id] = p
 
@@ -234,7 +239,14 @@ class PricingService:
                 name_cards.append(card)
 
         # 2. Fallback for cards needing name lookup or cards with 0-price printings
-        all_card_norms = list({normalize_card_name(c.get("name", "")) for c in cards if c.get("name")})
+        all_card_norms_set = {normalize_card_name(c.get("name", "")) for c in cards if c.get("name")}
+        for p in printings_by_id.values():
+            cat = getattr(p, "catalog", None)
+            cat_norm = getattr(cat, "normalizedName", None) if cat else None
+            if cat_norm:
+                all_card_norms_set.add(cat_norm)
+
+        all_card_norms = [n for n in all_card_norms_set if n]
         printings_by_norm: Dict[str, Any] = {}
         if all_card_norms:
             catalog_printings = await db.cardprinting.find_many(
@@ -312,26 +324,35 @@ class PricingService:
             q = _build_quote(printing, name) if printing else None
 
             # If the printing by ID has no price, 0.0, or printings_by_norm has a cheaper positive print:
-            if norm in printings_by_norm:
-                cheapest_p = printings_by_norm[norm]
-                cheaper_q = _build_quote(cheapest_p, name)
+            cat = getattr(printing, "catalog", None) if printing else None
+            cat_norm = getattr(cat, "normalizedName", None) if cat else None
+            effective_norm = norm or cat_norm
+
+            if effective_norm and effective_norm in printings_by_norm:
+                cheapest_p = printings_by_norm[effective_norm]
+                cheaper_q = _build_quote(cheapest_p, name or getattr(cheapest_p, "cardName", ""))
                 if cheaper_q and cheaper_q.unitPrice.trend > 0.0:
                     if not q or q.unitPrice.trend <= 0.0 or cheaper_q.unitPrice.trend < q.unitPrice.trend:
                         q = cheaper_q
                         printing = cheapest_p
 
-            if cid:
-                _price_cache[f"{provider}:{cid}"] = {"timestamp": now, "quote": q}
-            if norm:
-                _price_cache[f"{provider}:{norm}"] = {"timestamp": now, "quote": q}
-            if printing and getattr(printing, "id", None):
-                _price_cache[f"{provider}:{printing.id}"] = {"timestamp": now, "quote": q}
+            if q and q.unitPrice.trend > 0.0:
+                if cid:
+                    _price_cache[f"{provider}:{cid}"] = {"timestamp": now, "quote": q}
+                if norm:
+                    _price_cache[f"{provider}:{norm}"] = {"timestamp": now, "quote": q}
+                if effective_norm:
+                    _price_cache[f"{provider}:{effective_norm}"] = {"timestamp": now, "quote": q}
+                if printing and getattr(printing, "id", None):
+                    _price_cache[f"{provider}:{printing.id}"] = {"timestamp": now, "quote": q}
 
             if q:
                 if cid:
                     results[cid] = q
                 if norm:
                     results[norm] = q
+                if effective_norm:
+                    results[effective_norm] = q
                 if printing and getattr(printing, "id", None):
                     results[printing.id] = q
 
