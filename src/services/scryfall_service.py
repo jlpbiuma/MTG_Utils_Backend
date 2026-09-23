@@ -35,6 +35,21 @@ WITH searchable AS (
            regexp_replace(translate(lower(coalesce(name_es, '')), '{_SEARCH_TRANSLATE_FROM}', '{_SEARCH_TRANSLATE_TO}'),
                           '[^a-z0-9]+', ' ', 'g') AS search_name_es_spaced
     FROM card_catalog
+    WHERE name NOT LIKE 'A-%'
+      AND name NOT LIKE 'a-%'
+      AND coalesce(collector_number, '') NOT LIKE 'A-%'
+      AND coalesce(collector_number, '') NOT LIKE 'a-%'
+      AND coalesce(type_line, '') NOT ILIKE '%emblem%'
+      AND coalesce(type_line, '') NOT ILIKE '%token%'
+      AND coalesce(type_line, '') NOT IN ('Card', 'Card // Card', 'card', 'card // card')
+      AND (length(coalesce(set_code, '')) != 4 OR coalesce(set_code, '') NOT LIKE 'a%')
+      AND coalesce(set_code, '') NOT LIKE 'y%'
+      AND coalesce(set_code, '') NOT IN (
+          'ana', 'anb', 'xana', 'oana', 'ajmp', 'pana', 'parl',
+          'ea1', 'ea2', 'ea3', 'ha1', 'ha2', 'ha3', 'ha4', 'ha5', 'ha6', 'ha7',
+          'aa1', 'aa2', 'aa3', 'aa4', 'pa1', 'hbg', 'j21', 'sir', 'sis', 'akr', 'klr', 'pio', 'om1', 'omb',
+          'me1', 'me2', 'me3', 'me4', 'vma', 'tpr', 'td0', 'td2', 'pz1', 'pz2', 'prm', 'pmoa', 'psdg', 'past'
+      )
 )
 SELECT id, name, mana_cost, type_line, image_uri, set_code, collector_number
 FROM searchable
@@ -214,6 +229,7 @@ class ScryfallService:
 
         # Database-first: hit the local CardCatalog cache before Scryfall.
         local_results = await ScryfallService.search_cards_local(query.strip())
+        local_results = [c for c in local_results if is_playable_card(c)]
         local_results.sort(key=lambda c: (score_card_match(c.get("name"), query), c.get("name") or ""))
 
         top_score = score_card_match(local_results[0].get("name"), query) if local_results else 99
@@ -226,10 +242,11 @@ class ScryfallService:
                 "source": "local",
             }
 
-        # Fallback to or supplement with live Scryfall API
+        # Fallback to or supplement with live Scryfall API (filtering out Arena and digital cards)
         async with httpx.AsyncClient(headers=SCRYFALL_HEADERS, timeout=10.0) as client:
             try:
-                res = await client.get(f"{SCRYFALL_BASE}/cards/search", params={"q": query.strip(), "page": page})
+                scryfall_q = f"({query.strip()}) game:paper -is:digital -set_type:alchemy"
+                res = await client.get(f"{SCRYFALL_BASE}/cards/search", params={"q": scryfall_q, "page": page})
                 if res.status_code == 404:
                     return {"total_cards": len(local_results), "has_more": False, "data": local_results}
                 res.raise_for_status()
@@ -251,7 +268,10 @@ class ScryfallService:
     async def autocomplete_local(query: str, limit: int = 10) -> List[str]:
         """Names matching the query from the local CardCatalog, ignoring punctuation."""
         records = await ScryfallService._search_catalog_rows(query, limit)
-        return [name for name in (_field(record, "name") for record in records) if name]
+        return [
+            name for name in (_field(record, "name") for record in records)
+            if name and not name.startswith(("A-", "a-"))
+        ]
 
     @staticmethod
     async def autocomplete_cards(query: str) -> List[str]:
@@ -260,7 +280,7 @@ class ScryfallService:
 
         local_names = await ScryfallService.autocomplete_local(query.strip())
         if local_names:
-            return local_names
+            return [name for name in local_names if not name.startswith(("A-", "a-"))]
 
         async with httpx.AsyncClient(headers=SCRYFALL_HEADERS, timeout=5.0) as client:
             try:
@@ -268,7 +288,7 @@ class ScryfallService:
                 if res.status_code != 200:
                     return []
                 data = res.json()
-                return data.get("data", [])
+                return [name for name in data.get("data", []) if not name.startswith(("A-", "a-"))]
             except Exception as e:
                 logger.error(f"Error autocompleting cards: {e}")
                 return []
@@ -278,21 +298,30 @@ class ScryfallService:
         if not name or not name.strip():
             return None
 
+        clean_name = name.strip()
+        if clean_name.startswith(("A-", "a-")):
+            return None
+
         param_key = "exact" if exact else "fuzzy"
         async with httpx.AsyncClient(headers=SCRYFALL_HEADERS, timeout=8.0) as client:
             try:
-                res = await client.get(f"{SCRYFALL_BASE}/cards/named", params={param_key: name.strip()})
+                res = await client.get(f"{SCRYFALL_BASE}/cards/named", params={param_key: clean_name})
                 if res.status_code == 200:
                     card_data = res.json()
                     if is_playable_card(card_data):
                         return card_data
-                elif res.status_code == 404 and not exact:
-                    search_res = await client.get(f"{SCRYFALL_BASE}/cards/search", params={"q": name.strip()})
-                    if search_res.status_code == 200:
-                        search_data = search_res.json()
-                        playable = [c for c in search_data.get("data", []) if is_playable_card(c)]
-                        if playable:
-                            return playable[0]
+
+                # If named returned a digital/unplayable printing or 404, search for paper printings
+                search_q = f'!\"{clean_name}\" game:paper -is:digital -set_type:alchemy' if exact else f'({clean_name}) game:paper -is:digital -set_type:alchemy'
+                search_res = await client.get(
+                    f"{SCRYFALL_BASE}/cards/search",
+                    params={"q": search_q, "order": "released", "dir": "desc"},
+                )
+                if search_res.status_code == 200:
+                    search_data = search_res.json()
+                    playable = [c for c in search_data.get("data", []) if is_playable_card(c)]
+                    if playable:
+                        return playable[0]
                 return None
             except Exception as e:
                 logger.error(f"Error fetching card named '{name}': {e}")
@@ -327,6 +356,9 @@ class ScryfallService:
         """
         Checks CardCatalog in database, if not found queries Scryfall and saves to CardCatalog.
         """
+        if not name or name.strip().startswith(("A-", "a-")):
+            return None
+
         norm = normalize_card_name(name)
         if not norm:
             return None
@@ -699,14 +731,14 @@ class ScryfallService:
                 # Fallback: search for any Spanish printing of this card
                 if not es_card and c_name:
                     try:
-                        search_q = f'!"{c_name}" lang:es'
+                        search_q = f'!"{c_name}" lang:es game:paper -is:digital -set_type:alchemy'
                         res_search = await client.get(
                             f"{SCRYFALL_BASE}/cards/search",
                             params={"q": search_q, "order": "released", "dir": "desc"},
                         )
                         if res_search.status_code == 200:
                             s_data = res_search.json()
-                            candidates = s_data.get("data", [])
+                            candidates = [c for c in s_data.get("data", []) if is_playable_card(c)]
                             # Best match: same name and printed_name exists
                             best = None
                             for c in candidates:

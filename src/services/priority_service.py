@@ -6,6 +6,7 @@ from src.services.card_utils import (
     completion_percentages_by_deck,
     colors_by_deck,
     get_card_category,
+    is_arena_or_digital_set_code,
 )
 from src.services.image_resolver import safe_image_uri
 from src.services.pricing_service import PricingService, PRICE_PROVIDERS
@@ -115,14 +116,28 @@ class PriorityService:
 
         if all_norms:
             all_printings = await db.cardprinting.find_many(
-                where={"catalog": {"normalizedName": {"in": all_norms}}},
-                include={"catalog": True},
+                where={
+                    "catalog": {"normalizedName": {"in": all_norms}},
+                    "collectorNumber": {"not": {"startswith": "A-"}},
+                },
+                include={"catalog": True, "set": True},
             )
             for p in all_printings:
                 cat = getattr(p, "catalog", None)
                 norm = getattr(cat, "normalizedName", None) if cat else None
                 if not norm or norm not in grouped:
                     continue
+
+                collector_num = getattr(p, "collectorNumber", None)
+                if isinstance(collector_num, str) and collector_num.startswith(("A-", "a-")):
+                    continue
+                set_obj = getattr(p, "set", None)
+                if set_obj is not None:
+                    if getattr(set_obj, "isDigital", False) is True or getattr(set_obj, "setType", None) == "alchemy":
+                        continue
+                    set_code = getattr(set_obj, "code", None)
+                    if isinstance(set_code, str) and is_arena_or_digital_set_code(set_code):
+                        continue
 
                 p_price = float(p.priceCardmarketTrend or p.priceEur or 0.0)
 

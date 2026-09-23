@@ -12,7 +12,7 @@ from src.schemas.pricing import (
 )
 from datetime import date as _date, datetime, timedelta, timezone
 from src.core.config import settings
-from src.services.card_utils import normalize_card_name
+from src.services.card_utils import normalize_card_name, is_arena_or_digital_set_code
 from src.core.db import db
 
 logger = logging.getLogger("mtg_backend.pricing")
@@ -227,9 +227,19 @@ class PricingService:
         if valid_ids:
             found = await db.cardprinting.find_many(
                 where={"id": {"in": list(set(valid_ids))}},
-                include={"catalog": True},
+                include={"catalog": True, "set": True},
             )
             for p in found:
+                set_obj = getattr(p, "set", None)
+                if set_obj is not None:
+                    if getattr(set_obj, "isDigital", False) is True or getattr(set_obj, "setType", None) == "alchemy":
+                        continue
+                    set_code = getattr(set_obj, "code", None)
+                    if isinstance(set_code, str) and is_arena_or_digital_set_code(set_code):
+                        continue
+                collector_num = getattr(p, "collectorNumber", None)
+                if isinstance(collector_num, str) and collector_num.startswith(("A-", "a-")):
+                    continue
                 printings_by_id[p.id] = p
 
         # Check for cards with scryfallId that were not found in DB
@@ -250,8 +260,11 @@ class PricingService:
         printings_by_norm: Dict[str, Any] = {}
         if all_card_norms:
             catalog_printings = await db.cardprinting.find_many(
-                where={"catalog": {"normalizedName": {"in": all_card_norms}}},
-                include={"catalog": True},
+                where={
+                    "catalog": {"normalizedName": {"in": all_card_norms}},
+                    "collectorNumber": {"not": {"startswith": "A-"}},
+                },
+                include={"catalog": True, "set": True},
                 order={"updatedAt": "desc"},
             )
             for p in catalog_printings:
@@ -259,6 +272,17 @@ class PricingService:
                 cat_norm = getattr(cat, "normalizedName", None) if cat else None
                 if not cat_norm:
                     continue
+                collector_num = getattr(p, "collectorNumber", None)
+                if isinstance(collector_num, str) and collector_num.startswith(("A-", "a-")):
+                    continue
+                set_obj = getattr(p, "set", None)
+                if set_obj is not None:
+                    if getattr(set_obj, "isDigital", False) is True or getattr(set_obj, "setType", None) == "alchemy":
+                        continue
+                    set_code = getattr(set_obj, "code", None)
+                    if isinstance(set_code, str) and is_arena_or_digital_set_code(set_code):
+                        continue
+
                 p_price = p.priceCardmarketTrend or p.priceEur or 0.0
                 existing = printings_by_norm.get(cat_norm)
                 if existing is None:

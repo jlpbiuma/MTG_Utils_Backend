@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Query
 from typing import List, Dict, Any, Optional
 from src.services.scryfall_service import ScryfallService
-from src.services.card_utils import normalize_card_name
+from src.services.card_utils import normalize_card_name, is_arena_or_digital_set_code
 from src.core.db import db
 from src.services.image_resolver import safe_image_uri, strip_scryfall_image_uris
 
@@ -78,6 +78,14 @@ async def get_card_details(
             set_obj = getattr(item, "set", None)
             set_name = getattr(set_obj, "name", None) if set_obj else None
             set_code = getattr(set_obj, "code", None) if set_obj else getattr(item, "setCode", None)
+            if getattr(set_obj, "isDigital", False):
+                continue
+            if getattr(set_obj, "setType", None) == "alchemy":
+                continue
+            if item.collectorNumber and (item.collectorNumber.startswith("A-") or item.collectorNumber.startswith("a-")):
+                continue
+            if is_arena_or_digital_set_code(set_code):
+                continue
             card["printings"].append(
                 {
                     "id": item.id,
