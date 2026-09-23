@@ -273,6 +273,7 @@ class EdhrecService:
         top100_only: bool = False,
         owned_commander_only: bool = False,
         sort_by: str = "completion",
+        sort_dir: Optional[str] = None,
         page: int = 1,
         page_size: int = 24,
     ) -> CommanderRecommendationsListResponse:
@@ -419,12 +420,91 @@ class EdhrecService:
                 topCardsCoverage=group_coverage(cmd, "topcards", user_collection_names),
             ))
 
+        from src.services.edhrec_deck_service import recommendation_prices, estimate_values, with_commander_for_pricing
+
+        if sort_by in ("owned_value", "missing_value"):
+            all_selections, all_candidates = {}, {}
+            for summary in summaries:
+                cmd_obj = commanders_by_slug.get(summary.slug)
+                if not cmd_obj:
+                    continue
+                selected, required = select_recommended_cards(cmd_obj, user_collection_names)
+                selected = with_commander_for_pricing(cmd_obj, selected)
+                all_selections[summary.slug] = (selected, required + 1)
+                all_candidates.update({norm: card for norm, card, _ in selected})
+            quotes = {}
+            if all_candidates:
+                quotes, _ = await recommendation_prices(all_candidates, collection_cards, db)
+            for summary in summaries:
+                if summary.slug in all_selections:
+                    selected, required = all_selections[summary.slug]
+                    for field, value in estimate_values(selected, required, user_collection_names, quotes).items():
+                        setattr(summary, field, value)
+
+        direction = (sort_dir or "").lower()
+
         if sort_by == "rank":
-            summaries.sort(key=lambda s: (0 if s.edhrecRank else 1, s.edhrecRank or 9999, -s.completionPercentage))
+            is_asc = direction == "asc" if direction in ("asc", "desc") else True
+            summaries.sort(
+                key=lambda s: (
+                    0 if s.edhrecRank else 1,
+                    (s.edhrecRank or 9999) if is_asc else -(s.edhrecRank or 0),
+                    -s.completionPercentage,
+                )
+            )
         elif sort_by == "name":
-            summaries.sort(key=lambda s: s.name.lower())
+            is_asc = direction == "asc" if direction in ("asc", "desc") else True
+            summaries.sort(key=lambda s: s.name.lower(), reverse=not is_asc)
+        elif sort_by == "owned_value":
+            is_asc = direction == "asc" if direction in ("asc", "desc") else False
+            summaries.sort(
+                key=lambda s: (
+                    s.ownedValue if is_asc else -s.ownedValue,
+                    -s.completionPercentage,
+                    0 if s.edhrecRank else 1,
+                    s.edhrecRank or 9999,
+                )
+            )
+        elif sort_by == "missing_value":
+            is_asc = direction == "asc" if direction in ("asc", "desc") else True
+            summaries.sort(
+                key=lambda s: (
+                    s.missingValue if is_asc else -s.missingValue,
+                    -s.completionPercentage,
+                    0 if s.edhrecRank else 1,
+                    s.edhrecRank or 9999,
+                )
+            )
+        elif sort_by == "synergy":
+            is_asc = direction == "asc" if direction in ("asc", "desc") else False
+            summaries.sort(
+                key=lambda s: (
+                    (s.highSynergyCoverage.percentage if s.highSynergyCoverage and s.highSynergyCoverage.percentage is not None else (999.0 if is_asc else -1.0)) * (1 if is_asc else -1),
+                    -s.completionPercentage,
+                    0 if s.edhrecRank else 1,
+                    s.edhrecRank or 9999,
+                )
+            )
+        elif sort_by == "top_cards":
+            is_asc = direction == "asc" if direction in ("asc", "desc") else False
+            summaries.sort(
+                key=lambda s: (
+                    (s.topCardsCoverage.percentage if s.topCardsCoverage and s.topCardsCoverage.percentage is not None else (999.0 if is_asc else -1.0)) * (1 if is_asc else -1),
+                    -s.completionPercentage,
+                    0 if s.edhrecRank else 1,
+                    s.edhrecRank or 9999,
+                )
+            )
         else: # "completion"
-            summaries.sort(key=lambda s: (-s.completionPercentage, 0 if s.edhrecRank else 1, s.edhrecRank or 9999, -s.numDecks))
+            is_asc = direction == "asc" if direction in ("asc", "desc") else False
+            summaries.sort(
+                key=lambda s: (
+                    s.completionPercentage if is_asc else -s.completionPercentage,
+                    0 if s.edhrecRank else 1,
+                    s.edhrecRank or 9999,
+                    -s.numDecks,
+                )
+            )
 
         total_items = len(summaries)
         page_size = max(1, min(page_size, 100))
@@ -434,21 +514,24 @@ class EdhrecService:
         start_idx = (page - 1) * page_size
         paged_items = summaries[start_idx : start_idx + page_size]
 
-        # Price only the visible page, using one batch for all its selected cards.
-        from src.services.edhrec_deck_service import recommendation_prices, estimate_values, with_commander_for_pricing
-        selections, candidates = {}, {}
-        for summary in paged_items:
-            selected, required = select_recommended_cards(commanders_by_slug[summary.slug], user_collection_names)
-            selected = with_commander_for_pricing(commanders_by_slug[summary.slug], selected)
-            selections[summary.slug] = (selected, required + 1)
-            candidates.update({norm: card for norm, card, _ in selected})
-        quotes = {}
-        if candidates:
-            quotes, _ = await recommendation_prices(candidates, collection_cards, db)
-        for summary in paged_items:
-            selected, required = selections[summary.slug]
-            for field, value in estimate_values(selected, required, user_collection_names, quotes).items():
-                setattr(summary, field, value)
+        if sort_by not in ("owned_value", "missing_value"):
+            selections, candidates = {}, {}
+            for summary in paged_items:
+                cmd_obj = commanders_by_slug.get(summary.slug)
+                if not cmd_obj:
+                    continue
+                selected, required = select_recommended_cards(cmd_obj, user_collection_names)
+                selected = with_commander_for_pricing(cmd_obj, selected)
+                selections[summary.slug] = (selected, required + 1)
+                candidates.update({norm: card for norm, card, _ in selected})
+            quotes = {}
+            if candidates:
+                quotes, _ = await recommendation_prices(candidates, collection_cards, db)
+            for summary in paged_items:
+                if summary.slug in selections:
+                    selected, required = selections[summary.slug]
+                    for field, value in estimate_values(selected, required, user_collection_names, quotes).items():
+                        setattr(summary, field, value)
 
         return CommanderRecommendationsListResponse(
             total=total_items,

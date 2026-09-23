@@ -40,6 +40,7 @@ async def get_commander_recommendations(
     top100_only: bool = Query(False),
     owned_commander_only: bool = Query(False),
     sort_by: str = Query("completion"),
+    sort_dir: Optional[str] = Query(None),
     page: int = Query(1),
     page_size: int = Query(24),
     user_id: str = Depends(get_current_user_id),
@@ -51,6 +52,7 @@ async def get_commander_recommendations(
         top100_only=top100_only,
         owned_commander_only=owned_commander_only,
         sort_by=sort_by,
+        sort_dir=sort_dir,
         page=page,
         page_size=page_size,
     )

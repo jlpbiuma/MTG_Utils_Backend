@@ -338,3 +338,114 @@ async def test_completion_uses_all_recommendations_with_quotas_and_unique_owned_
     assert commander.totalRequiredCards == 4
     assert commander.ownedCardsCount == 2
     assert commander.completionPercentage == 50
+
+
+@pytest.mark.asyncio
+async def test_commander_recommendations_new_sorting_modes():
+    user_id = "user-1"
+
+    cmd1 = MagicMock(
+        id="c1",
+        normalizedName="commander one",
+        slug="commander-one",
+        colorIdentity="W",
+        isTop100=False,
+        rank=10,
+        numDecks=1000,
+        creatureCount=1,
+        instantCount=0,
+        sorceryCount=0,
+        artifactCount=0,
+        enchantmentCount=0,
+        battleCount=0,
+        planeswalkerCount=0,
+        landCount=0,
+        basicLandCount=0,
+        nonbasicLandCount=0,
+        cardsJson={
+            "creatures": [{"name": "Owned Card 1"}],
+            "highsynergycards": [{"name": "Owned Card 1"}],
+            "topcards": [{"name": "Unowned Card 1"}],
+        },
+        canonicalCardNames=["Owned Card 1"],
+    )
+    cmd1.name = "Commander One"
+
+    cmd2 = MagicMock(
+        id="c2",
+        normalizedName="commander two",
+        slug="commander-two",
+        colorIdentity="U",
+        isTop100=False,
+        rank=20,
+        numDecks=2000,
+        creatureCount=1,
+        instantCount=0,
+        sorceryCount=0,
+        artifactCount=0,
+        enchantmentCount=0,
+        battleCount=0,
+        planeswalkerCount=0,
+        landCount=0,
+        basicLandCount=0,
+        nonbasicLandCount=0,
+        cardsJson={
+            "creatures": [{"name": "Owned Card 2"}],
+            "highsynergycards": [{"name": "Unowned Card 2"}],
+            "topcards": [{"name": "Owned Card 2"}],
+        },
+        canonicalCardNames=["Owned Card 2"],
+    )
+    cmd2.name = "Commander Two"
+
+    mock_db = MagicMock()
+    mock_db.cardprinting.find_many = AsyncMock(return_value=[])
+    mock_db.deck.find_many = AsyncMock(return_value=[])
+    mock_db.deckcard.find_many = AsyncMock(return_value=[])
+    mock_db.collectioncard.find_many = AsyncMock(return_value=[
+        MagicMock(isFoil=False, cardScryfallId="p1", cardName="Owned Card 1", quantity=1),
+        MagicMock(isFoil=False, cardScryfallId="p2", cardName="Owned Card 2", quantity=1),
+    ])
+    mock_db.edhreccommander.find_many = AsyncMock(return_value=[cmd1, cmd2])
+
+    from src.schemas.pricing import CardPriceQuote, UnitPriceBreakdown
+    mock_quotes = {
+        "owned card 1": CardPriceQuote(
+            scryfallId="p1", cardName="Owned Card 1",
+            unitPrice=UnitPriceBreakdown(trend=10.0), subtotal=10.0,
+            lastUpdated=datetime.now(timezone.utc)
+        ),
+        "owned card 2": CardPriceQuote(
+            scryfallId="p2", cardName="Owned Card 2",
+            unitPrice=UnitPriceBreakdown(trend=25.0), subtotal=25.0,
+            lastUpdated=datetime.now(timezone.utc)
+        ),
+    }
+
+    with patch("src.services.edhrec_service.db", mock_db), \
+         patch("src.services.edhrec_deck_service.recommendation_prices", AsyncMock(return_value=(mock_quotes, {}))):
+
+        # 1. Sort by synergy (desc): Commander One has 100% synergy, Commander Two has 0%
+        res_syn = await EdhrecService.get_commander_recommendations_for_user(user_id=user_id, sort_by="synergy")
+        assert res_syn.commanders[0].name == "Commander One"
+        assert res_syn.commanders[1].name == "Commander Two"
+
+        # Synergy asc: Commander Two first
+        res_syn_asc = await EdhrecService.get_commander_recommendations_for_user(user_id=user_id, sort_by="synergy", sort_dir="asc")
+        assert res_syn_asc.commanders[0].name == "Commander Two"
+        assert res_syn_asc.commanders[1].name == "Commander One"
+
+        # 2. Sort by top_cards (desc): Commander Two has 100% top cards, Commander One has 0%
+        res_top = await EdhrecService.get_commander_recommendations_for_user(user_id=user_id, sort_by="top_cards")
+        assert res_top.commanders[0].name == "Commander Two"
+        assert res_top.commanders[1].name == "Commander One"
+
+        # 3. Sort by owned_value (desc): Commander Two has 25.0 EUR owned value, Commander One has 10.0 EUR
+        res_owned = await EdhrecService.get_commander_recommendations_for_user(user_id=user_id, sort_by="owned_value")
+        assert res_owned.commanders[0].name == "Commander Two"
+        assert res_owned.commanders[1].name == "Commander One"
+
+        # owned_value (asc): Commander One (10 EUR) first
+        res_owned_asc = await EdhrecService.get_commander_recommendations_for_user(user_id=user_id, sort_by="owned_value", sort_dir="asc")
+        assert res_owned_asc.commanders[0].name == "Commander One"
+        assert res_owned_asc.commanders[1].name == "Commander Two"
