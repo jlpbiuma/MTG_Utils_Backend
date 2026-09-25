@@ -1,5 +1,6 @@
 import re
 import logging
+import asyncio
 from types import SimpleNamespace
 from typing import List, Dict, Any, Optional
 from src.core.db import db
@@ -84,14 +85,16 @@ async def _is_commander_eligible(card_name: str, type_line: Optional[str]) -> bo
 class DeckService:
     @staticmethod
     async def get_user_decks(user_id: str) -> List[DeckSummaryResponse]:
-        decks = await db.deck.find_many(
-            where={"userId": user_id},
-            include={"cards": True},
-            order={"updatedAt": "desc"}
+        decks, collection_cards = await asyncio.gather(
+            db.deck.find_many(
+                where={"userId": user_id},
+                include={"cards": True},
+                order={"updatedAt": "desc"},
+            ),
+            db.collectioncard.find_many(where={"userId": user_id}),
         )
 
         # Get user collection
-        collection_cards = await db.collectioncard.find_many(where={"userId": user_id})
         col_map: Dict[str, int] = {}
         for c in (collection_cards or []):
             norm = normalize_card_name(c.cardName)

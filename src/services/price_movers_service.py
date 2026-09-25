@@ -86,6 +86,18 @@ def compute_mover_for_points(
     if abs(change_pct) < 1e-6:
         return None
 
+    printing_id = None
+    if printing is not None:
+        printing_id = getattr(printing, "id", None)
+    if not printing_id:
+        first = usable[0]
+        printing_id = (
+            getattr(first, "cardPrintingId", None)
+            or getattr(first, "scryfallId", None)
+        )
+    if not printing_id:
+        return None
+
     catalog = getattr(printing, "catalog", None) if printing is not None else None
     card_set = getattr(printing, "set", None) if printing is not None else None
     card_name = getattr(catalog, "name", None) or getattr(printing, "cardName", None) or "Unknown"
@@ -96,7 +108,7 @@ def compute_mover_for_points(
         image = printing.imageUriSmall or printing.imageUri or printing.imageUriLarge
 
     return PriceMoverItem(
-        printingId=printing.id if printing is not None else usable[0].cardPrintingId,
+        printingId=printing_id,
         catalogId=getattr(printing, "catalogId", None) if printing is not None else None,
         cardName=card_name,
         setCode=set_code,
@@ -290,6 +302,7 @@ class PriceMoversService:
             from types import SimpleNamespace
             by_printing[h.scryfallId].append(
                 SimpleNamespace(
+                    cardPrintingId=h.scryfallId,
                     trendPrice=round(h.priceCents / 100.0, 2),
                     recordedAt=pt_dt,
                 )

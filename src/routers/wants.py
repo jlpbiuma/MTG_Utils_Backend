@@ -4,6 +4,7 @@ from src.core.auth import get_current_user_id
 from src.schemas.wants import (
     WantCardCreate,
     WantCardUpdate,
+    WantCardUpdateVersion,
     WantCardResponse,
     WantStats,
     WantQueryResponse,
@@ -64,6 +65,25 @@ async def update_want_quantity(
         data.setCode,
         set_code_provided="setCode" in data.model_fields_set,
     )
+
+
+@router.patch("/{card_id}/version", response_model=WantCardResponse)
+async def update_want_card_version(
+    card_id: str,
+    data: WantCardUpdateVersion,
+    user_id: str = Depends(get_current_user_id),
+):
+    res = await WantService.update_card_version(
+        user_id=user_id,
+        card_id=card_id,
+        card_scryfall_id=data.cardScryfallId,
+        image_uri=data.imageUri,
+        set_code=data.setCode,
+        collector_number=data.collectorNumber,
+    )
+    if not res:
+        raise HTTPException(status_code=404, detail="Carta no encontrada en wants")
+    return res
 
 
 @router.delete("/{card_id}")

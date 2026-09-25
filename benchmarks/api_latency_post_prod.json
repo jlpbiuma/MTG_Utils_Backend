@@ -1,0 +1,171 @@
+{
+  "schema": "api_latency_v1",
+  "measured_at": "2026-09-24T15:35:59.040301+00:00",
+  "base": "http://192.168.0.4:8000",
+  "user_id": "88da13c0-ac6a-43b5-be2b-7a9b39ccfec7",
+  "runs": 5,
+  "endpoints": {
+    "health": {
+      "n": 5,
+      "mean_ms": 13.4,
+      "median_ms": 9.7,
+      "p95_ms": 22.9,
+      "min_ms": 8.7,
+      "max_ms": 22.9,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 57,
+      "path": "/api/health",
+      "method": "GET"
+    },
+    "decks": {
+      "n": 5,
+      "mean_ms": 1063.0,
+      "median_ms": 816.3,
+      "p95_ms": 1896.8,
+      "min_ms": 777.3,
+      "max_ms": 1896.8,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 61052,
+      "path": "/api/decks",
+      "method": "GET"
+    },
+    "collection_query": {
+      "n": 5,
+      "mean_ms": 1568.2,
+      "median_ms": 1525.4,
+      "p95_ms": 1799.3,
+      "min_ms": 1464.1,
+      "max_ms": 1799.3,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 4311180,
+      "path": "/api/collection/query",
+      "method": "GET"
+    },
+    "wants_query": {
+      "n": 5,
+      "mean_ms": 889.7,
+      "median_ms": 873.8,
+      "p95_ms": 945.2,
+      "min_ms": 862.8,
+      "max_ms": 945.2,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 78993,
+      "path": "/api/wants/query",
+      "method": "GET"
+    },
+    "priorities": {
+      "n": 5,
+      "mean_ms": 1606.4,
+      "median_ms": 927.7,
+      "p95_ms": 4388.7,
+      "min_ms": 838.7,
+      "max_ms": 4388.7,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 290989,
+      "path": "/api/priorities?page=1&limit=100",
+      "method": "GET"
+    },
+    "scryfall_search": {
+      "n": 5,
+      "mean_ms": 225.8,
+      "median_ms": 219.1,
+      "p95_ms": 263.8,
+      "min_ms": 207.6,
+      "max_ms": 263.8,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 1039,
+      "path": "/api/scryfall/search?q=sol+ring&limit=15",
+      "method": "GET"
+    },
+    "pricing_collection": {
+      "n": 5,
+      "mean_ms": 473.6,
+      "median_ms": 496.3,
+      "p95_ms": 549.8,
+      "min_ms": 379.1,
+      "max_ms": 549.8,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 3293847,
+      "path": "/api/pricing",
+      "method": "POST"
+    },
+    "pricing_collection_history": {
+      "n": 5,
+      "mean_ms": 1822.2,
+      "median_ms": 1807.1,
+      "p95_ms": 2003.0,
+      "min_ms": 1692.2,
+      "max_ms": 2003.0,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 1986,
+      "path": "/api/pricing/collection/history?days=30",
+      "method": "GET"
+    },
+    "whatsapp_matches": {
+      "n": 5,
+      "mean_ms": 8.3,
+      "median_ms": 8.0,
+      "p95_ms": 11.8,
+      "min_ms": 6.6,
+      "max_ms": 11.8,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 144,
+      "path": "/api/whatsapp/matches",
+      "method": "GET"
+    }
+  }
+}

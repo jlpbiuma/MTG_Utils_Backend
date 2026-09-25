@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from src.core.config import settings
 from src.core.db import connect_db, disconnect_db
-from src.routers import decks, collection, scryfall, edhrec, pricing, import_cards, worker, catalog
+from src.core.timing import RequestTimingMiddleware
 
 logging.basicConfig(level=logging.INFO)
 # Silence internal Prisma engine and HTTP transport logs to prevent terminal spam
@@ -35,7 +35,8 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS Middleware
+# Timing first so CORS (and other outer middleware) wrap it; duration covers handlers.
+app.add_middleware(RequestTimingMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.BACKEND_CORS_ORIGINS,
@@ -46,7 +47,7 @@ app.add_middleware(
 )
 
 
-from src.routers import decks, collection, scryfall, edhrec, pricing, import_cards, worker, auth, wants, catalog, priorities, simulated_collections
+from src.routers import decks, collection, scryfall, edhrec, pricing, import_cards, worker, auth, wants, catalog, priorities, simulated_collections, whatsapp_deals, cards
 
 # Include API Routers
 app.include_router(auth.router, prefix="/api")
@@ -61,6 +62,8 @@ app.include_router(catalog.router, prefix="/api")
 app.include_router(wants.router, prefix="/api")
 app.include_router(priorities.router, prefix="/api")
 app.include_router(simulated_collections.router, prefix="/api")
+app.include_router(whatsapp_deals.router, prefix="/api")
+app.include_router(cards.router, prefix="/api")
 
 
 @app.get("/api/health")

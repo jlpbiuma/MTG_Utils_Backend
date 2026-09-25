@@ -24,12 +24,15 @@ def make_test_card(card_id: str, name: str, scry_id: str, qty: int = 1, assigned
 def make_mock_printing(scry_id: str, name: str, trend: float):
     p = MagicMock()
     p.id = scry_id
+    p.collectorNumber = "1"
+    p.priceEur = trend
     p.priceCardmarketTrend = trend
     p.priceCardmarketMin = trend * 0.9
     p.priceCardmarketMax = trend * 1.2
     p.pricesUpdatedAt = datetime.now()
     p.catalog = MagicMock()
     p.catalog.normalizedName = name.lower()
+    p.set = None
     return p
 
 @pytest.mark.asyncio
@@ -66,6 +69,11 @@ async def test_batch_pricing_reduces_query_count():
     mock_db.cardprinting.find_first = AsyncMock(return_value=None)
     mock_db.cardpricehistory.find_many = AsyncMock(return_value=[])
     mock_db.cardpricehistory.find_first = AsyncMock(return_value=None)
+    mock_db.query_raw = AsyncMock(side_effect=RuntimeError("sql unavailable in unit tests"))
+    mock_db.edhreccommander.find_many = AsyncMock(return_value=[])
+
+    from src.services.pricing_service import clear_price_cache
+    clear_price_cache()
 
     with patch("src.services.deck_service.db", mock_db), \
          patch("src.services.pricing_service.db", mock_db):
@@ -114,6 +122,10 @@ async def test_batch_and_single_quote_equivalence():
     mock_db = MagicMock()
     mock_db.cardprinting.find_many = AsyncMock(return_value=printings)
     mock_db.cardpricehistory.find_many = AsyncMock(return_value=[])
+    mock_db.query_raw = AsyncMock(side_effect=RuntimeError("sql unavailable in unit tests"))
+
+    from src.services.pricing_service import clear_price_cache
+    clear_price_cache()
 
     with patch("src.services.pricing_service.db", mock_db):
         batch_quotes = await PricingService.get_latest_quotes_batch(cards_data, "cardmarket", "EUR")

@@ -1,5 +1,6 @@
 import logging
 import functools
+import asyncio
 from typing import List, Dict, Any, Optional
 from src.core.db import db
 from src.schemas.collection import (
@@ -135,11 +136,14 @@ class CollectionService:
         direction: str = "asc",
         grouped: bool = True,
         price_provider: str = "cardmarket",
+        page: int = 1,
+        limit: Optional[int] = None,
     ) -> CollectionQueryResponse:
         """
         Filters the WHOLE collection by name, then sorts and optionally groups
         it into MTG type sections entirely on the backend, so the frontend never
         performs these operations over a partial (paginated) card set.
+        Flat (non-grouped) responses can be page-sliced after sort.
         """
         where_clause: Dict[str, Any] = {"userId": user_id}
         if query and query.strip():
@@ -150,11 +154,11 @@ class CollectionService:
             order=[{"cardName": "asc"}, {"id": "asc"}],
         )
 
-        local_images = await resolve_minio_image_uris(
-            [c.cardScryfallId for c in cards]
-        )
-        decks_by_norm = await CollectionService._deck_demand_by_name(
-            user_id, col_cards=cards if not (query and query.strip()) else None
+        local_images, decks_by_norm = await asyncio.gather(
+            resolve_minio_image_uris([c.cardScryfallId for c in cards]),
+            CollectionService._deck_demand_by_name(
+                user_id, col_cards=cards if not (query and query.strip()) else None
+            ),
         )
 
         items: List[CollectionCardResponse] = []
@@ -208,20 +212,31 @@ class CollectionService:
 
         unique_cards = len(items)
         total_cards = sum(c.quantity for c in items)
+        currency_symbol = (
+            price_summary.currencySymbol if price_summary is not None else "€"
+        )
+        safe_page = max(1, page)
+        page_limit = limit if limit and limit > 0 else None
 
         if not grouped:
+            has_more = False
+            page_items = items
+            if page_limit is not None:
+                start = (safe_page - 1) * page_limit
+                end = start + page_limit
+                page_items = items[start:end]
+                has_more = end < unique_cards
             return CollectionQueryResponse(
                 query=normalized_query,
                 grouped=False,
                 provider=price_provider,
-                currencySymbol=(
-                    price_summary.currencySymbol
-                    if price_summary is not None
-                    else "€"
-                ),
+                currencySymbol=currency_symbol,
                 totalCards=total_cards,
                 uniqueCards=unique_cards,
-                cards=items,
+                page=safe_page,
+                limit=page_limit,
+                hasMore=has_more,
+                cards=page_items,
             )
 
         sections = CollectionService._group_collection_sections(
@@ -231,13 +246,12 @@ class CollectionService:
             query=normalized_query,
             grouped=True,
             provider=price_provider,
-            currencySymbol=(
-                price_summary.currencySymbol
-                if price_summary is not None
-                else "€"
-            ),
+            currencySymbol=currency_symbol,
             totalCards=total_cards,
             uniqueCards=unique_cards,
+            page=1,
+            limit=None,
+            hasMore=False,
             sections=sections,
         )
 
@@ -435,6 +449,97 @@ class CollectionService:
             where={"id": card_id},
             data=update_data
         )
+        return CollectionCardResponse(
+            id=updated.id,
+            userId=updated.userId,
+            cardScryfallId=updated.cardScryfallId,
+            cardName=updated.cardName,
+            quantity=updated.quantity,
+            isFoil=getattr(updated, "isFoil", False),
+            setCode=updated.setCode,
+            collectorNumber=updated.collectorNumber,
+            manaCost=updated.manaCost,
+            typeLine=updated.typeLine,
+            imageUri=safe_image_uri(updated.imageUri),
+            updatedAt=updated.updatedAt,
+        )
+
+    @staticmethod
+    async def update_card_version(
+        user_id: str,
+        card_id: str,
+        card_scryfall_id: str,
+        image_uri: Optional[str] = None,
+        set_code: Optional[str] = None,
+        collector_number: Optional[str] = None,
+    ) -> Optional[CollectionCardResponse]:
+        card = await db.collectioncard.find_unique(where={"id": card_id})
+        if not card or card.userId != user_id:
+            return None
+
+        effective_image = safe_image_uri(image_uri) or image_uri
+        is_foil = getattr(card, "isFoil", False)
+
+        if card.cardScryfallId == card_scryfall_id:
+            update_data: Dict[str, Any] = {}
+            if effective_image:
+                update_data["imageUri"] = effective_image
+            if set_code is not None:
+                update_data["setCode"] = set_code
+            if collector_number is not None:
+                update_data["collectorNumber"] = collector_number
+            if update_data:
+                updated = await db.collectioncard.update(where={"id": card_id}, data=update_data)
+            else:
+                updated = card
+            return CollectionCardResponse(
+                id=updated.id,
+                userId=updated.userId,
+                cardScryfallId=updated.cardScryfallId,
+                cardName=updated.cardName,
+                quantity=updated.quantity,
+                isFoil=getattr(updated, "isFoil", False),
+                setCode=updated.setCode,
+                collectorNumber=updated.collectorNumber,
+                manaCost=updated.manaCost,
+                typeLine=updated.typeLine,
+                imageUri=safe_image_uri(updated.imageUri),
+                updatedAt=updated.updatedAt,
+            )
+
+        conflict = await db.collectioncard.find_first(
+            where={
+                "userId": user_id,
+                "cardScryfallId": card_scryfall_id,
+                "isFoil": is_foil,
+                "id": {"not": card_id},
+            }
+        )
+        if conflict:
+            updated = await db.collectioncard.update(
+                where={"id": conflict.id},
+                data={
+                    "quantity": conflict.quantity + card.quantity,
+                    "imageUri": effective_image or conflict.imageUri,
+                    "setCode": set_code if set_code is not None else conflict.setCode,
+                    "collectorNumber": (
+                        collector_number
+                        if collector_number is not None
+                        else conflict.collectorNumber
+                    ),
+                },
+            )
+            await db.collectioncard.delete(where={"id": card_id})
+        else:
+            update_data = {"cardScryfallId": card_scryfall_id}
+            if effective_image:
+                update_data["imageUri"] = effective_image
+            if set_code is not None:
+                update_data["setCode"] = set_code
+            if collector_number is not None:
+                update_data["collectorNumber"] = collector_number
+            updated = await db.collectioncard.update(where={"id": card_id}, data=update_data)
+
         return CollectionCardResponse(
             id=updated.id,
             userId=updated.userId,

@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Optional
 from src.core.auth import get_current_user_id
 from src.schemas.collection import (
-    CollectionCardCreate, CollectionCardUpdate,
+    CollectionCardCreate, CollectionCardUpdate, CollectionCardUpdateVersion,
     CollectionCardResponse, CollectionStats, CollectionQueryResponse,
     DormantCardsResponse,
 )
@@ -36,11 +36,13 @@ async def get_collection_query(
     direction: str = Query("asc", pattern="^(asc|desc)$"),
     grouped: bool = Query(True),
     priceProvider: str = Query("cardmarket"),
+    page: int = Query(1, ge=1),
+    limit: Optional[int] = Query(None, ge=1, le=500),
     user_id: str = Depends(get_current_user_id)
 ):
     """
-    Returns the WHOLE collection, filtered, sorted and grouped into MTG type
-    sections entirely on the backend (no frontend-side partial operations).
+    Returns the collection filtered, sorted and optionally grouped into MTG type
+    sections on the backend. Flat lists accept page/limit slicing.
     """
     return await CollectionService.get_user_collection_query(
         user_id,
@@ -49,6 +51,8 @@ async def get_collection_query(
         direction=direction,
         grouped=grouped,
         price_provider=priceProvider,
+        page=page,
+        limit=limit,
     )
 
 @router.post("/add-or-increment", response_model=CollectionCardResponse)
@@ -68,6 +72,25 @@ async def update_collection_quantity(
         data.setCode,
         set_code_provided="setCode" in data.model_fields_set,
     )
+    return res
+
+
+@router.patch("/{card_id}/version", response_model=CollectionCardResponse)
+async def update_collection_card_version(
+    card_id: str,
+    data: CollectionCardUpdateVersion,
+    user_id: str = Depends(get_current_user_id),
+):
+    res = await CollectionService.update_card_version(
+        user_id=user_id,
+        card_id=card_id,
+        card_scryfall_id=data.cardScryfallId,
+        image_uri=data.imageUri,
+        set_code=data.setCode,
+        collector_number=data.collectorNumber,
+    )
+    if not res:
+        raise HTTPException(status_code=404, detail="Carta no encontrada en la colección")
     return res
 
 @router.delete("/{card_id}")

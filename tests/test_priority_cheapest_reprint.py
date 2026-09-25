@@ -69,6 +69,7 @@ async def test_priority_selects_cheapest_non_zero_reprint():
     mock_db.deck.find_many = AsyncMock(return_value=[deck])
     mock_db.collectioncard.find_many = AsyncMock(return_value=[])  # Not owned -> deficit = 1
     mock_db.cardprinting.find_many = AsyncMock(return_value=[p_zero, p_expensive, p_cheapest])
+    mock_db.query_raw = AsyncMock(side_effect=RuntimeError("sql unavailable in unit tests"))
 
     fake_quote = CardPriceQuote(
         scryfallId="sol-ring-cheapest-reprint",
@@ -89,6 +90,7 @@ async def test_priority_selects_cheapest_non_zero_reprint():
     }
 
     with patch("src.services.priority_service.db", mock_db), \
+         patch("src.services.pricing_service.db", mock_db), \
          patch("src.services.priority_service.PricingService.get_price_summary", new_callable=AsyncMock, return_value=fake_price_summary):
 
         res = await PriorityService.get_priorities(user_id="user-1")
@@ -109,14 +111,16 @@ async def test_priority_selects_cheapest_non_zero_reprint():
 
 
 @pytest.mark.asyncio
-async def test_pricing_batch_resolves_cheapest_reprint():
-    """Verify PricingService.get_latest_quotes_batch resolves to the cheapest non-zero reprint."""
+async def test_pricing_batch_prefers_exact_printing_when_priced():
+    """When the requested scryfallId has a positive price, do not override to cheapest."""
     catalog = MagicMock()
     catalog.normalizedName = "demonic tutor"
 
     p_expensive = MagicMock()
     p_expensive.id = "dt-expensive"
     p_expensive.catalog = catalog
+    p_expensive.collectorNumber = "1"
+    p_expensive.set = None
     p_expensive.priceEur = 120.0
     p_expensive.priceCardmarketTrend = 120.0
     p_expensive.priceCardmarketMin = 100.0
@@ -126,6 +130,8 @@ async def test_pricing_batch_resolves_cheapest_reprint():
     p_cheap = MagicMock()
     p_cheap.id = "dt-cheap"
     p_cheap.catalog = catalog
+    p_cheap.collectorNumber = "2"
+    p_cheap.set = None
     p_cheap.priceEur = 28.50
     p_cheap.priceCardmarketTrend = 28.50
     p_cheap.priceCardmarketMin = 25.0
@@ -133,12 +139,15 @@ async def test_pricing_batch_resolves_cheapest_reprint():
     p_cheap.pricesUpdatedAt = datetime.now()
 
     mock_db = MagicMock()
-    # If queried with dt-expensive scryfallId
     mock_db.cardprinting.find_many = AsyncMock(side_effect=[
-        [p_expensive],            # 1. find by valid_ids
-        [p_expensive, p_cheap],   # 2. find catalog printings
+        [p_expensive],
+        [p_expensive, p_cheap],
     ])
     mock_db.cardpricehistory.find_many = AsyncMock(return_value=[])
+    mock_db.query_raw = AsyncMock(side_effect=RuntimeError("sql unavailable in unit tests"))
+
+    from src.services.pricing_service import clear_price_cache
+    clear_price_cache()
 
     with patch("src.services.pricing_service.db", mock_db):
         quotes = await PricingService.get_latest_quotes_batch(
@@ -147,8 +156,59 @@ async def test_pricing_batch_resolves_cheapest_reprint():
             currency="EUR",
         )
 
-        # The quote returned should be for the cheaper printing (28.50 €), not 120.00 €
         quote = quotes.get("dt-expensive") or quotes.get("demonic tutor")
+        assert quote is not None
+        assert quote.scryfallId == "dt-expensive"
+        assert quote.unitPrice.trend == 120.0
+
+
+@pytest.mark.asyncio
+async def test_pricing_batch_falls_back_to_cheapest_when_exact_unpriced():
+    """If the exact printing has no usable price, fall back to cheapest playable reprint."""
+    catalog = MagicMock()
+    catalog.normalizedName = "demonic tutor"
+
+    p_zero = MagicMock()
+    p_zero.id = "dt-zero"
+    p_zero.catalog = catalog
+    p_zero.collectorNumber = "1"
+    p_zero.set = None
+    p_zero.priceEur = 0.0
+    p_zero.priceCardmarketTrend = 0.0
+    p_zero.priceCardmarketMin = 0.0
+    p_zero.priceCardmarketMax = 0.0
+    p_zero.pricesUpdatedAt = datetime.now()
+
+    p_cheap = MagicMock()
+    p_cheap.id = "dt-cheap"
+    p_cheap.catalog = catalog
+    p_cheap.collectorNumber = "2"
+    p_cheap.set = None
+    p_cheap.priceEur = 28.50
+    p_cheap.priceCardmarketTrend = 28.50
+    p_cheap.priceCardmarketMin = 25.0
+    p_cheap.priceCardmarketMax = 35.0
+    p_cheap.pricesUpdatedAt = datetime.now()
+
+    mock_db = MagicMock()
+    mock_db.cardprinting.find_many = AsyncMock(side_effect=[
+        [p_zero],
+        [p_zero, p_cheap],
+    ])
+    mock_db.cardpricehistory.find_many = AsyncMock(return_value=[])
+    mock_db.query_raw = AsyncMock(side_effect=RuntimeError("sql unavailable in unit tests"))
+
+    from src.services.pricing_service import clear_price_cache
+    clear_price_cache()
+
+    with patch("src.services.pricing_service.db", mock_db):
+        quotes = await PricingService.get_latest_quotes_batch(
+            cards=[{"name": "Demonic Tutor", "scryfallId": "dt-zero", "quantity": 1}],
+            provider="cardmarket",
+            currency="EUR",
+        )
+
+        quote = quotes.get("dt-zero") or quotes.get("demonic tutor")
         assert quote is not None
         assert quote.scryfallId == "dt-cheap"
         assert quote.unitPrice.trend == 28.50

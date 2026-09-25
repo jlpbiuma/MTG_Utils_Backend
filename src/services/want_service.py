@@ -372,6 +372,69 @@ class WantService:
         return WantService._to_response(updated)
 
     @staticmethod
+    async def update_card_version(
+        user_id: str,
+        card_id: str,
+        card_scryfall_id: str,
+        image_uri: Optional[str] = None,
+        set_code: Optional[str] = None,
+        collector_number: Optional[str] = None,
+    ) -> Optional[WantCardResponse]:
+        existing = await db.wantcard.find_unique(where={"id": card_id})
+        if not existing or existing.userId != user_id:
+            return None
+
+        effective_image = safe_image_uri(image_uri) or image_uri
+
+        if existing.cardScryfallId == card_scryfall_id:
+            update_data: Dict[str, Any] = {}
+            if effective_image:
+                update_data["imageUri"] = effective_image
+            if set_code is not None:
+                update_data["setCode"] = set_code
+            if collector_number is not None:
+                update_data["collectorNumber"] = collector_number
+            if update_data:
+                updated = await db.wantcard.update(where={"id": card_id}, data=update_data)
+            else:
+                updated = existing
+            return WantService._to_response(updated)
+
+        conflict = await db.wantcard.find_first(
+            where={
+                "userId": user_id,
+                "cardScryfallId": card_scryfall_id,
+                "id": {"not": card_id},
+            }
+        )
+        if conflict:
+            updated = await db.wantcard.update(
+                where={"id": conflict.id},
+                data={
+                    "quantity": conflict.quantity + existing.quantity,
+                    "imageUri": effective_image or conflict.imageUri,
+                    "setCode": set_code if set_code is not None else conflict.setCode,
+                    "collectorNumber": (
+                        collector_number
+                        if collector_number is not None
+                        else conflict.collectorNumber
+                    ),
+                },
+            )
+            await db.wantcard.delete(where={"id": card_id})
+        else:
+            update_data = {"cardScryfallId": card_scryfall_id}
+            if effective_image:
+                update_data["imageUri"] = effective_image
+            if set_code is not None:
+                update_data["setCode"] = set_code
+            if collector_number is not None:
+                update_data["collectorNumber"] = collector_number
+            updated = await db.wantcard.update(where={"id": card_id}, data=update_data)
+
+        return WantService._to_response(updated)
+
+    @staticmethod
     async def delete_card(user_id: str, card_id: str) -> bool:
         existing = await db.wantcard.find_unique(where={"id": card_id})
         if not existing or existing.userId != user_id:

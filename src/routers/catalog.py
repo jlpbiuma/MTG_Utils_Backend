@@ -1,6 +1,7 @@
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+import logging
 import time
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Response
 
@@ -16,6 +17,8 @@ from src.schemas.pricing import (
 )
 from src.services.pricing_service import PRICE_PROVIDERS
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/catalog", tags=["catalog"])
 
 PRICE_HISTORY_CACHE_TTL = 3600  # 1 hour
@@ -25,6 +28,61 @@ PRICE_HISTORY_CACHE_MAX_ENTRIES = 2000
 _price_history_cache: dict[tuple[str, str, Optional[int]], tuple[float, CardPriceHistoryResponse]] = {}
 # Fast lookup index: printing_id -> catalog_id
 _printing_to_catalog_map: dict[str, str] = {}
+
+_major_expansions_cache: list[dict] = []
+_major_expansions_cache_ts: float = 0
+MAJOR_EXPANSIONS_CACHE_TTL = 3600  # 1 hour
+
+
+async def get_major_expansions() -> list[dict]:
+    """Retrieve all primary MTG expansion set releases (like in MTGGoldfish) ordered by release date."""
+    global _major_expansions_cache, _major_expansions_cache_ts
+    now = time.time()
+    if _major_expansions_cache and (now - _major_expansions_cache_ts < MAJOR_EXPANSIONS_CACHE_TTL):
+        return _major_expansions_cache
+
+    query = """
+        WITH eligible_sets AS (
+            SELECT code, name, set_type, released_at, card_count, icon_svg_uri,
+                   CASE set_type
+                       WHEN 'expansion' THEN 1
+                       WHEN 'core' THEN 2
+                       WHEN 'draft_innovation' THEN 3
+                       WHEN 'masters' THEN 4
+                       WHEN 'commander' THEN 5
+                       ELSE 6
+                   END as type_rank
+            FROM card_sets
+            WHERE is_digital = false
+              AND set_type IN ('expansion', 'core', 'masters', 'draft_innovation', 'commander')
+              AND released_at IS NOT NULL
+              AND card_count >= 30
+              AND code != 'plst'
+        ),
+        ranked AS (
+            SELECT code, name, set_type, released_at, card_count, icon_svg_uri,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY released_at::date
+                       ORDER BY type_rank ASC, card_count DESC
+                   ) as rn
+            FROM eligible_sets
+        )
+        SELECT code, name, set_type as "setType", released_at as "releasedAt", icon_svg_uri as "iconSvgUri"
+        FROM ranked
+        WHERE rn = 1
+        ORDER BY released_at ASC;
+    """
+    try:
+        if hasattr(db, "query_raw") and callable(getattr(db, "query_raw", None)):
+            res = await db.query_raw(query)
+            if res:
+                _major_expansions_cache = res
+                _major_expansions_cache_ts = now
+                return res
+    except Exception as e:
+        logger.warning(f"Error fetching major expansions: {e}")
+
+    return _major_expansions_cache
 
 
 def get_cached_price_history(
@@ -50,8 +108,10 @@ def set_cached_price_history(
 
 
 def clear_price_history_cache():
+    global _major_expansions_cache_ts
     _price_history_cache.clear()
     _printing_to_catalog_map.clear()
+    _major_expansions_cache_ts = 0
 
 
 @router.get("/sets", response_model=list[CardSetResponse])
@@ -194,10 +254,13 @@ async def card_price_history(
                     )
 
     series: list[PrintingPriceSeries] = []
-    expansions_map: dict[str, CardExpansionRelease] = {}
+    card_printings_by_set: dict[str, Any] = {}
     for printing in printings:
         set_obj = getattr(printing, "set", None)
-        set_code = getattr(set_obj, "code", None) or ""
+        set_code = (getattr(set_obj, "code", None) or "").lower()
+        if set_code and set_code not in card_printings_by_set:
+            card_printings_by_set[set_code] = printing
+
         set_name = getattr(set_obj, "name", None) or set_code.upper()
         icon_svg = getattr(set_obj, "iconSvgUri", None)
         rel_at = printing.releasedAt.isoformat() if getattr(printing, "releasedAt", None) else (set_obj.releasedAt.isoformat() if (set_obj and getattr(set_obj, "releasedAt", None)) else None)
@@ -217,16 +280,53 @@ async def card_price_history(
             )
         )
 
+    # MTG Expansion Releases like in MTGGoldfish
+    expansions_map: dict[str, CardExpansionRelease] = {}
+    major_sets = await get_major_expansions()
+    since_str = since.strftime("%Y-%m-%d") if days is not None else None
+
+    for s in major_sets:
+        s_code = (s.get("code") or "").lower()
+        if not s_code:
+            continue
+        rel_val = s.get("releasedAt")
+        rel_str = str(rel_val)[:10] if rel_val else ""
+        if since_str and rel_str and rel_str < since_str:
+            continue
+
+        iso_rel = rel_val.isoformat() if hasattr(rel_val, "isoformat") else (str(rel_val) if rel_val else None)
+        card_p = card_printings_by_set.get(s_code)
+        expansions_map[s_code] = CardExpansionRelease(
+            setCode=s_code,
+            setName=s.get("name") or s_code.upper(),
+            releasedAt=iso_rel,
+            iconSvgUri=s.get("iconSvgUri"),
+            collectorNumber=getattr(card_p, "collectorNumber", None) if card_p else None,
+            printingId=getattr(card_p, "id", None) if card_p else None,
+            trendPrice=(getattr(card_p, "priceCardmarketTrend", None) or getattr(card_p, "priceEur", None)) if card_p else None,
+            hasPrinting=bool(card_p),
+        )
+
+    # Also include any printings of this card in special sets (e.g. SLD, MPS, Box topper, promo)
+    # or as fallback if major_sets wasn't populated (e.g. in minimal unit test mocks)
+    for printing in printings:
+        set_obj = getattr(printing, "set", None)
+        set_code = (getattr(set_obj, "code", None) or "").lower()
         if set_code and set_code not in expansions_map:
-            expansions_map[set_code] = CardExpansionRelease(
-                setCode=set_code,
-                setName=set_name,
-                releasedAt=rel_at,
-                iconSvgUri=icon_svg,
-                collectorNumber=getattr(printing, "collectorNumber", ""),
-                printingId=printing.id,
-                trendPrice=getattr(printing, "priceCardmarketTrend", None) or getattr(printing, "priceEur", None),
-            )
+            p_rel = getattr(printing, "releasedAt", None) or (set_obj and getattr(set_obj, "releasedAt", None))
+            p_rel_str = str(p_rel)[:10] if p_rel else ""
+            if not since_str or not p_rel_str or p_rel_str >= since_str:
+                rel_at = printing.releasedAt.isoformat() if getattr(printing, "releasedAt", None) else (set_obj.releasedAt.isoformat() if (set_obj and getattr(set_obj, "releasedAt", None)) else None)
+                expansions_map[set_code] = CardExpansionRelease(
+                    setCode=set_code,
+                    setName=getattr(set_obj, "name", None) or set_code.upper(),
+                    releasedAt=rel_at,
+                    iconSvgUri=getattr(set_obj, "iconSvgUri", None),
+                    collectorNumber=getattr(printing, "collectorNumber", ""),
+                    printingId=printing.id,
+                    trendPrice=getattr(printing, "priceCardmarketTrend", None) or getattr(printing, "priceEur", None),
+                    hasPrinting=True,
+                )
 
     expansions = sorted(
         expansions_map.values(),

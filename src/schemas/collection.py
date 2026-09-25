@@ -19,6 +19,14 @@ class CollectionCardUpdate(BaseModel):
     quantity: int = Field(..., ge=0)
     setCode: Optional[str] = None
 
+
+class CollectionCardUpdateVersion(BaseModel):
+    cardScryfallId: str
+    imageUri: Optional[str] = None
+    setCode: Optional[str] = None
+    collectorNumber: Optional[str] = None
+
+
 class CollectionCardResponse(BaseModel):
     id: str
     userId: str
@@ -65,6 +73,9 @@ class CollectionQueryResponse(BaseModel):
     currencySymbol: str = "€"
     totalCards: int = 0
     uniqueCards: int = 0
+    page: int = 1
+    limit: Optional[int] = None
+    hasMore: bool = False
     sections: List[CollectionGroupSection] = []
     cards: List[CollectionCardResponse] = []
 

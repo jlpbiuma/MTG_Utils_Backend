@@ -11,6 +11,11 @@ class Settings(BaseSettings):
         "http://localhost:8000",
     ]
     DEMO_USER_ID: str = "00000000-0000-0000-0000-000000000000"
+    WHATSAPP_DB_PATH: str = os.getenv("WHATSAPP_DB_PATH", "/app/whatsapp_data/cards.db")
+    SLOW_REQUEST_MS: float = float(os.getenv("SLOW_REQUEST_MS", "200"))
+    OCR_API_URL: str = os.getenv("OCR_API_URL", "http://host.docker.internal:8020")
+    OCR_API_TOKEN: str = os.getenv("OCR_API_TOKEN", "")
+    OCR_API_TIMEOUT: float = float(os.getenv("OCR_API_TIMEOUT", "15"))
 
     model_config = SettingsConfigDict(
         env_file=".env",

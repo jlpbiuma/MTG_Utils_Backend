@@ -89,6 +89,24 @@ def test_compute_mover_skips_flat_single_point():
     assert item is None
 
 
+def test_compute_mover_without_printing_uses_point_id():
+    """CM history points only carry cardPrintingId; printing may be missing."""
+    window_start = _dt(30)
+    points = [_point("orphan-1", 1.0, 25), _point("orphan-1", 2.0, 2)]
+    item = compute_mover_for_points(
+        points,
+        window_start=window_start,
+        printing=None,
+        provider="cardmarket",
+        currency="EUR",
+        symbol="€",
+    )
+    assert item is not None
+    assert item.printingId == "orphan-1"
+    assert item.changePct == 100.0
+    assert item.cardName == "Unknown"
+
+
 @pytest.mark.asyncio
 async def test_movers_endpoint_returns_gainers_and_losers():
     now = datetime.now(timezone.utc)

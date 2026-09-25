@@ -145,3 +145,56 @@ async def test_price_history_printing_id_populates_cache_for_all_printings():
             res3 = await client.get("/api/catalog/cards/print-sf-1/price-history")
             assert res3.status_code == 200
             assert res3.headers.get("X-Cache") == "HIT"
+
+
+@pytest.mark.asyncio
+async def test_price_history_major_expansions_and_reprints():
+    catalog = SimpleNamespace(id="cat-sf", name="Sacred Foundry")
+    set_grn = SimpleNamespace(code="grn", name="Guilds of Ravnica", iconSvgUri="http://img/grn.svg", releasedAt=datetime(2018, 10, 5, tzinfo=timezone.utc))
+    p1 = SimpleNamespace(
+        id="print-sf-1",
+        catalogId="cat-sf",
+        collectorNumber="254",
+        rarity="rare",
+        imageUri=None,
+        imageUriSmall=None,
+        releasedAt=datetime(2018, 10, 5, tzinfo=timezone.utc),
+        priceEur=12.5,
+        priceCardmarketTrend=13.0,
+        set=set_grn,
+    )
+
+    major_sets_mock = [
+        {"code": "grn", "name": "Guilds of Ravnica", "setType": "expansion", "releasedAt": "2018-10-05T00:00:00+00:00", "iconSvgUri": "http://img/grn.svg"},
+        {"code": "rna", "name": "Ravnica Allegiance", "setType": "expansion", "releasedAt": "2019-01-25T00:00:00+00:00", "iconSvgUri": "http://img/rna.svg"},
+        {"code": "war", "name": "War of the Spark", "setType": "expansion", "releasedAt": "2019-05-03T00:00:00+00:00", "iconSvgUri": "http://img/war.svg"},
+    ]
+
+    db_mock = SimpleNamespace(
+        cardcatalog=SimpleNamespace(find_unique=AsyncMock(return_value=catalog)),
+        cardprinting=SimpleNamespace(find_many=AsyncMock(return_value=[p1])),
+        cmpricehistory=SimpleNamespace(find_many=AsyncMock(return_value=[])),
+        query_raw=AsyncMock(return_value=major_sets_mock),
+    )
+
+    with patch("src.routers.catalog.db", new=db_mock):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            res = await client.get("/api/catalog/cards/cat-sf/price-history?days=3650")
+            assert res.status_code == 200
+            data = res.json()
+            expansions = data["expansions"]
+            assert len(expansions) == 3
+
+            # grn has this card printed
+            grn_exp = next(e for e in expansions if e["setCode"] == "grn")
+            assert grn_exp["hasPrinting"] is True
+            assert grn_exp["printingId"] == "print-sf-1"
+            assert grn_exp["trendPrice"] == 13.0
+
+            # rna and war are major MTG expansion launches where this card was not printed
+            rna_exp = next(e for e in expansions if e["setCode"] == "rna")
+            assert rna_exp["hasPrinting"] is False
+            assert rna_exp["printingId"] is None
+
+            war_exp = next(e for e in expansions if e["setCode"] == "war")
+            assert war_exp["hasPrinting"] is False

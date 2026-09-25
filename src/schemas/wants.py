@@ -20,6 +20,13 @@ class WantCardUpdate(BaseModel):
     setCode: Optional[str] = None
 
 
+class WantCardUpdateVersion(BaseModel):
+    cardScryfallId: str
+    imageUri: Optional[str] = None
+    setCode: Optional[str] = None
+    collectorNumber: Optional[str] = None
+
+
 class WantCardResponse(BaseModel):
     id: str
     userId: str

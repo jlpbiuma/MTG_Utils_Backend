@@ -2,6 +2,7 @@ import time
 import httpx
 import logging
 from typing import List, Dict, Any, Optional
+from types import SimpleNamespace
 from src.schemas.pricing import (
     PriceSummary,
     CardPriceQuote,
@@ -12,7 +13,12 @@ from src.schemas.pricing import (
 )
 from datetime import date as _date, datetime, timedelta, timezone
 from src.core.config import settings
-from src.services.card_utils import normalize_card_name, is_arena_or_digital_set_code
+from src.services.card_utils import (
+    normalize_card_name,
+    is_arena_or_digital_set_code,
+    ARENA_AND_DIGITAL_SET_CODES,
+    NON_PLAYABLE_TYPES,
+)
 from src.core.db import db
 
 logger = logging.getLogger("mtg_backend.pricing")
@@ -23,6 +29,11 @@ PRICE_PROVIDERS = {
 
 CACHE_TTL_SECONDS = 3 * 24 * 3600  # 3 days = 259,200 seconds
 _price_cache: Dict[str, Dict[str, Any]] = {}
+
+
+def clear_price_cache() -> None:
+    _price_cache.clear()
+
 
 class PricingService:
     @staticmethod
@@ -222,7 +233,7 @@ class PricingService:
             else:
                 name_cards.append(card)
 
-        # 1. Fetch printings by ID
+        # 1. Fetch printings by ID (prices live on the row; skip digital/Arena)
         printings_by_id: Dict[str, Any] = {}
         if valid_ids:
             found = await db.cardprinting.find_many(
@@ -230,86 +241,42 @@ class PricingService:
                 include={"catalog": True, "set": True},
             )
             for p in found:
-                set_obj = getattr(p, "set", None)
-                if set_obj is not None:
-                    if getattr(set_obj, "isDigital", False) is True or getattr(set_obj, "setType", None) == "alchemy":
-                        continue
-                    set_code = getattr(set_obj, "code", None)
-                    if isinstance(set_code, str) and is_arena_or_digital_set_code(set_code):
-                        continue
-                collector_num = getattr(p, "collectorNumber", None)
-                if isinstance(collector_num, str) and collector_num.startswith(("A-", "a-")):
+                if PricingService._is_excluded_printing(p):
                     continue
                 printings_by_id[p.id] = p
 
-        # Check for cards with scryfallId that were not found in DB
-        for card in cards:
+        # Cards whose id missed the DB or whose printing has no usable price
+        for card in cards_to_fetch:
             cid = card.get("scryfallId") or ""
-            if cid and cid not in printings_by_id and card not in name_cards:
+            printing = printings_by_id.get(cid) if cid else None
+            if cid and printing is None and card not in name_cards:
                 name_cards.append(card)
+            elif printing is not None and not PricingService._printing_unit_trend(printing):
+                if card not in name_cards:
+                    name_cards.append(card)
 
-        # 2. Fallback for cards needing name lookup or cards with 0-price printings
-        all_card_norms_set = {normalize_card_name(c.get("name", "")) for c in cards if c.get("name")}
+        # 2. Cheapest playable printing per normalized name (one row each, SQL)
+        norms_needed = {
+            normalize_card_name(c.get("name", ""))
+            for c in cards_to_fetch
+            if c.get("name")
+        }
         for p in printings_by_id.values():
             cat = getattr(p, "catalog", None)
             cat_norm = getattr(cat, "normalizedName", None) if cat else None
             if cat_norm:
-                all_card_norms_set.add(cat_norm)
-
-        all_card_norms = [n for n in all_card_norms_set if n]
-        printings_by_norm: Dict[str, Any] = {}
-        if all_card_norms:
-            catalog_printings = await db.cardprinting.find_many(
-                where={
-                    "catalog": {"normalizedName": {"in": all_card_norms}},
-                    "collectorNumber": {"not": {"startswith": "A-"}},
-                },
-                include={"catalog": True, "set": True},
-                order={"updatedAt": "desc"},
-            )
-            for p in catalog_printings:
-                cat = getattr(p, "catalog", None)
-                cat_norm = getattr(cat, "normalizedName", None) if cat else None
-                if not cat_norm:
-                    continue
-                collector_num = getattr(p, "collectorNumber", None)
-                if isinstance(collector_num, str) and collector_num.startswith(("A-", "a-")):
-                    continue
-                set_obj = getattr(p, "set", None)
-                if set_obj is not None:
-                    if getattr(set_obj, "isDigital", False) is True or getattr(set_obj, "setType", None) == "alchemy":
-                        continue
-                    set_code = getattr(set_obj, "code", None)
-                    if isinstance(set_code, str) and is_arena_or_digital_set_code(set_code):
-                        continue
-
-                p_price = p.priceCardmarketTrend or p.priceEur or 0.0
-                existing = printings_by_norm.get(cat_norm)
-                if existing is None:
-                    printings_by_norm[cat_norm] = p
-                else:
-                    existing_price = existing.priceCardmarketTrend or existing.priceEur or 0.0
-                    # ALWAYS pick the cheapest non-zero printing!
-                    if existing_price <= 0.0 and p_price > 0.0:
-                        printings_by_norm[cat_norm] = p
-                    elif p_price > 0.0 and (existing_price <= 0.0 or p_price < existing_price):
-                        printings_by_norm[cat_norm] = p
+                norms_needed.add(cat_norm)
+        printings_by_norm = await PricingService._cheapest_printings_by_norm(list(norms_needed))
 
         all_printings = list(printings_by_id.values()) + list(printings_by_norm.values())
         if not all_printings:
             return {}
 
-        # 3. Batch query price history
-        printing_ids = list({p.id for p in all_printings})
-        history_map: Dict[str, Any] = {}
-        if printing_ids:
-            histories = await db.cardpricehistory.find_many(
-                where={"cardPrintingId": {"in": printing_ids}, "provider": provider},
-                order={"recordedAt": "desc"},
-            )
-            for h in histories:
-                if h.cardPrintingId not in history_map:
-                    history_map[h.cardPrintingId] = h
+        # 3. Latest history only for printings still missing on-row prices
+        history_map = await PricingService._latest_history_for_printings(
+            [p.id for p in all_printings if not PricingService._printing_unit_trend(p)],
+            provider,
+        )
 
         symbol = PRICE_PROVIDERS.get(provider, {}).get("symbol", "€")
 
@@ -347,18 +314,20 @@ class PricingService:
             printing = printings_by_id.get(cid)
             q = _build_quote(printing, name) if printing else None
 
-            # If the printing by ID has no price, 0.0, or printings_by_norm has a cheaper positive print:
+            # Prefer the exact requested printing when it has a usable price.
+            # Only fall back to the cheapest playable reprint when the exact id
+            # is missing or has no positive price (e.g. priorities / unresolved rows).
             cat = getattr(printing, "catalog", None) if printing else None
             cat_norm = getattr(cat, "normalizedName", None) if cat else None
             effective_norm = norm or cat_norm
 
-            if effective_norm and effective_norm in printings_by_norm:
+            exact_has_price = bool(q and q.unitPrice.trend > 0.0)
+            if not exact_has_price and effective_norm and effective_norm in printings_by_norm:
                 cheapest_p = printings_by_norm[effective_norm]
                 cheaper_q = _build_quote(cheapest_p, name or getattr(cheapest_p, "cardName", ""))
                 if cheaper_q and cheaper_q.unitPrice.trend > 0.0:
-                    if not q or q.unitPrice.trend <= 0.0 or cheaper_q.unitPrice.trend < q.unitPrice.trend:
-                        q = cheaper_q
-                        printing = cheapest_p
+                    q = cheaper_q
+                    printing = cheapest_p
 
             if q and q.unitPrice.trend > 0.0:
                 if cid:
@@ -383,6 +352,217 @@ class PricingService:
         return results
 
     @staticmethod
+    def _printing_unit_trend(printing: Any) -> float:
+        return float(getattr(printing, "priceCardmarketTrend", None) or getattr(printing, "priceEur", None) or 0.0)
+
+    @staticmethod
+    def _is_excluded_printing(printing: Any) -> bool:
+        """Exclude art series, memorabilia, tokens, Arena/Alchemy/digital printings."""
+        collector_num = getattr(printing, "collectorNumber", None)
+        if isinstance(collector_num, str) and collector_num.startswith(("A-", "a-")):
+            return True
+
+        catalog = getattr(printing, "catalog", None)
+        if catalog is not None:
+            name = getattr(catalog, "name", None)
+            if isinstance(name, str) and name.strip().startswith(("A-", "a-")):
+                return True
+            type_line_raw = getattr(catalog, "typeLine", None)
+            if type_line_raw is None:
+                type_line_raw = getattr(catalog, "type_line", None)
+            if isinstance(type_line_raw, str):
+                type_line = type_line_raw.strip().lower()
+                if type_line in NON_PLAYABLE_TYPES or type_line.startswith("card // card"):
+                    return True
+                if "token" in type_line or "emblem" in type_line:
+                    return True
+
+        set_obj = getattr(printing, "set", None)
+        set_code = None
+        if set_obj is not None and not isinstance(set_obj, type(None)):
+            # Ignore non-model mocks without real set fields
+            is_digital = getattr(set_obj, "isDigital", False)
+            if is_digital is True:
+                return True
+            set_type_raw = getattr(set_obj, "setType", None)
+            if isinstance(set_type_raw, str):
+                set_type = set_type_raw.strip().lower()
+                if set_type in ("alchemy", "memorabilia", "token"):
+                    return True
+            set_code = getattr(set_obj, "code", None)
+
+        if not isinstance(set_code, str):
+            set_code = getattr(printing, "setCode", None)
+        if not isinstance(set_code, str) and catalog is not None:
+            set_code = getattr(catalog, "setCode", None)
+            if not isinstance(set_code, str):
+                set_code = getattr(catalog, "set_code", None)
+
+        if isinstance(set_code, str):
+            code = set_code.strip().lower()
+            # Art-series / memorabilia set codes (e.g. afin, atmt)
+            if len(code) == 4 and code.startswith("a"):
+                return True
+            if is_arena_or_digital_set_code(code):
+                return True
+
+        return False
+
+    @staticmethod
+    async def _cheapest_printings_by_norm(norms: List[str]) -> Dict[str, Any]:
+        """One cheapest playable printing per normalized name via SQL (no reprint fan-out)."""
+        if not norms:
+            return {}
+        arena_codes = sorted(ARENA_AND_DIGITAL_SET_CODES)
+        try:
+            rows = await db.query_raw(
+                """
+                SELECT DISTINCT ON (cc.normalized_name)
+                    cp.id,
+                    cp.catalog_id AS "catalogId",
+                    cp.collector_number AS "collectorNumber",
+                    cp.image_uri AS "imageUri",
+                    cp.image_uri_small AS "imageUriSmall",
+                    cp.image_uri_large AS "imageUriLarge",
+                    cp.price_eur AS "priceEur",
+                    cp.price_eur_foil AS "priceEurFoil",
+                    cp.price_cardmarket_trend AS "priceCardmarketTrend",
+                    cp.price_cardmarket_min AS "priceCardmarketMin",
+                    cp.price_cardmarket_max AS "priceCardmarketMax",
+                    cp.prices_updated_at AS "pricesUpdatedAt",
+                    cc.normalized_name AS "normalizedName"
+                FROM card_printings cp
+                JOIN card_catalog cc ON cc.id = cp.catalog_id
+                LEFT JOIN card_sets cs ON cs.id = cp.set_id
+                WHERE cc.normalized_name = ANY($1::text[])
+                  AND coalesce(cp.collector_number, '') NOT LIKE 'A-%'
+                  AND coalesce(cp.collector_number, '') NOT LIKE 'a-%'
+                  AND coalesce(cs.is_digital, false) = false
+                  AND lower(coalesce(cs.set_type, '')) NOT IN ('alchemy', 'memorabilia', 'token')
+                  AND NOT (
+                    length(lower(coalesce(cs.code, ''))) = 4
+                    AND lower(coalesce(cs.code, '')) LIKE 'a%'
+                  )
+                  AND NOT (lower(coalesce(cs.code, '')) = ANY($2::text[]))
+                  AND NOT (lower(coalesce(cs.code, '')) ~ '^y[0-9a-z]{2,3}$')
+                  AND lower(coalesce(cc.type_line, '')) NOT IN ('card', 'card // card')
+                  AND lower(coalesce(cc.type_line, '')) NOT LIKE 'card // card%'
+                  AND lower(coalesce(cc.type_line, '')) NOT LIKE '%token%'
+                  AND lower(coalesce(cc.type_line, '')) NOT LIKE '%emblem%'
+                  AND coalesce(cc.name, '') NOT LIKE 'A-%'
+                  AND coalesce(cc.name, '') NOT LIKE 'a-%'
+                ORDER BY cc.normalized_name,
+                         CASE
+                           WHEN coalesce(cp.price_cardmarket_trend, cp.price_eur, 0) > 0
+                           THEN coalesce(cp.price_cardmarket_trend, cp.price_eur)
+                           ELSE 1e18
+                         END ASC,
+                         cp.updated_at DESC
+                """,
+                norms,
+                arena_codes,
+            )
+            result: Dict[str, Any] = {}
+            for row in rows or []:
+                norm = row.get("normalizedName")
+                if not norm:
+                    continue
+                result[norm] = SimpleNamespace(
+                    id=row["id"],
+                    catalogId=row.get("catalogId"),
+                    collectorNumber=row.get("collectorNumber"),
+                    imageUri=row.get("imageUri"),
+                    imageUriSmall=row.get("imageUriSmall"),
+                    imageUriLarge=row.get("imageUriLarge"),
+                    priceEur=row.get("priceEur"),
+                    priceEurFoil=row.get("priceEurFoil"),
+                    priceCardmarketTrend=row.get("priceCardmarketTrend"),
+                    priceCardmarketMin=row.get("priceCardmarketMin"),
+                    priceCardmarketMax=row.get("priceCardmarketMax"),
+                    pricesUpdatedAt=row.get("pricesUpdatedAt"),
+                    catalog=SimpleNamespace(normalizedName=norm),
+                    set=None,
+                )
+            return result
+        except Exception:
+            logger.debug("cheapest_printings_by_norm SQL unavailable; using ORM fallback", exc_info=True)
+
+        catalog_printings = await db.cardprinting.find_many(
+            where={
+                "catalog": {"normalizedName": {"in": norms}},
+                "collectorNumber": {"not": {"startswith": "A-"}},
+            },
+            include={"catalog": True, "set": True},
+            order={"updatedAt": "desc"},
+        )
+        printings_by_norm: Dict[str, Any] = {}
+        for p in catalog_printings:
+            if PricingService._is_excluded_printing(p):
+                continue
+            cat = getattr(p, "catalog", None)
+            cat_norm = getattr(cat, "normalizedName", None) if cat else None
+            if not cat_norm:
+                continue
+            p_price = PricingService._printing_unit_trend(p)
+            existing = printings_by_norm.get(cat_norm)
+            if existing is None:
+                printings_by_norm[cat_norm] = p
+            else:
+                existing_price = PricingService._printing_unit_trend(existing)
+                if existing_price <= 0.0 and p_price > 0.0:
+                    printings_by_norm[cat_norm] = p
+                elif p_price > 0.0 and (existing_price <= 0.0 or p_price < existing_price):
+                    printings_by_norm[cat_norm] = p
+        return printings_by_norm
+
+    @staticmethod
+    async def _latest_history_for_printings(printing_ids: List[str], provider: str) -> Dict[str, Any]:
+        """Latest history row per printing only (avoids loading full history tables)."""
+        if not printing_ids:
+            return {}
+        unique_ids = list(set(printing_ids))
+        try:
+            rows = await db.query_raw(
+                """
+                SELECT DISTINCT ON (card_printing_id)
+                    card_printing_id AS "cardPrintingId",
+                    trend_price AS "trendPrice",
+                    min_price AS "minPrice",
+                    max_price AS "maxPrice",
+                    recorded_at AS "recordedAt"
+                FROM card_price_history
+                WHERE card_printing_id = ANY($1::text[])
+                  AND provider = $2
+                ORDER BY card_printing_id, recorded_at DESC
+                """,
+                unique_ids,
+                provider,
+            )
+            return {
+                row["cardPrintingId"]: SimpleNamespace(
+                    cardPrintingId=row["cardPrintingId"],
+                    trendPrice=row.get("trendPrice"),
+                    minPrice=row.get("minPrice"),
+                    maxPrice=row.get("maxPrice"),
+                    recordedAt=row.get("recordedAt"),
+                )
+                for row in (rows or [])
+                if row.get("cardPrintingId")
+            }
+        except Exception:
+            logger.debug("latest_history SQL unavailable; using ORM fallback", exc_info=True)
+
+        histories = await db.cardpricehistory.find_many(
+            where={"cardPrintingId": {"in": unique_ids}, "provider": provider},
+            order={"recordedAt": "desc"},
+        )
+        history_map: Dict[str, Any] = {}
+        for h in histories:
+            if h.cardPrintingId not in history_map:
+                history_map[h.cardPrintingId] = h
+        return history_map
+
+    @staticmethod
     async def _latest_provider_quote(card: Dict[str, Any], provider: str, currency: str) -> Optional[CardPriceQuote]:
         """Read the most recent provider-specific quote from normalized tables."""
         card_id = card.get("scryfallId") or ""
@@ -398,12 +578,10 @@ class PricingService:
             )
         if not printing:
             return None
-        history = await db.cardpricehistory.find_first(
-            where={"cardPrintingId": printing.id, "provider": provider},
-            order={"recordedAt": "desc"},
-        )
-        if history:
-            trend, minimum, maximum, updated = history.trendPrice, history.minPrice, history.maxPrice, history.recordedAt
+        hist_map = await PricingService._latest_history_for_printings([printing.id], provider)
+        hist = hist_map.get(printing.id)
+        if hist:
+            trend, minimum, maximum, updated = hist.trendPrice, hist.minPrice, hist.maxPrice, hist.recordedAt
         else:
             trend = printing.priceCardmarketTrend or printing.priceEur
             minimum = printing.priceCardmarketMin or printing.priceEur
@@ -411,11 +589,18 @@ class PricingService:
             updated = printing.pricesUpdatedAt
         if trend is None:
             return None
+        symbol = PRICE_PROVIDERS.get(provider, {}).get("symbol", "€")
         return CardPriceQuote(
-            scryfallId=printing.id, cardName=card.get("name", ""), provider=provider,
-            currency=currency, currencySymbol=PRICE_PROVIDERS[provider]["symbol"],
+            scryfallId=printing.id,
+            cardName=card.get("name") or "",
+            provider=provider,
+            currency=currency,
+            currencySymbol=symbol,
             unitPrice=UnitPriceBreakdown(trend=trend or 0.0, min=minimum or 0.0, max=maximum or 0.0),
-            quantity=1, subtotal=trend or 0.0, purchaseUrl=None, lastUpdated=updated or datetime.now(),
+            quantity=1,
+            subtotal=trend or 0.0,
+            purchaseUrl=None,
+            lastUpdated=updated or datetime.now(),
         )
 
     @staticmethod
@@ -533,86 +718,82 @@ class PricingService:
                 card_qty_map[c.cardScryfallId] = card_qty_map.get(c.cardScryfallId, 0) + c.quantity
 
         printing_ids = list(card_qty_map.keys())
-        total_owned = sum(col_cards[i].quantity for i in range(len(col_cards)))
+        total_owned = sum(c.quantity for c in col_cards)
 
-        # Fetch current printings to get baseline current prices
         printings = await db.cardprinting.find_many(where={"id": {"in": printing_ids}})
-        current_card_prices: Dict[str, float] = {}
-        for p in printings:
-            current_card_prices[p.id] = float(p.priceCardmarketTrend or p.priceEur or 0.0)
-
+        current_card_prices: Dict[str, float] = {
+            p.id: float(p.priceCardmarketTrend or p.priceEur or 0.0) for p in printings
+        }
         current_val = sum(
             current_card_prices.get(pid, 0.0) * qty
             for pid, qty in card_qty_map.items()
         )
 
         now = datetime.now(timezone.utc)
-        start_date = now - timedelta(days=days if days > 0 else 30)
-
-        # 1. First query new cm_price_history table
-        cm_model = getattr(db, "cmpricehistory", None)
-        cm_histories = []
-        if cm_model is not None:
-            cm_histories = await cm_model.find_many(
-                where={
-                    "scryfallId": {"in": printing_ids},
-                    "date": {"gte": start_date - timedelta(days=2)},
-                },
-                order={"date": "asc"},
-            )
-
-        # Map by printing_id -> list of points
-        by_printing: Dict[str, List[Any]] = {}
-        for h in cm_histories:
-            # Wrap as compatible point
-            pt_dt = datetime.combine(h.date, datetime.min.time(), tzinfo=timezone.utc) if isinstance(h.date, _date) and not isinstance(h.date, datetime) else (h.date if getattr(h.date, "tzinfo", None) else h.date.replace(tzinfo=timezone.utc))
-            pt_price = round(h.priceCents / 100.0, 2)
-            by_printing.setdefault(h.scryfallId, []).append({
-                "recordedAt": pt_dt,
-                "trendPrice": pt_price,
-            })
-
-        # Fallback to legacy card_price_history if needed
-        uncovered_ids = [pid for pid in printing_ids if pid not in by_printing]
-        if uncovered_ids:
-            legacy_histories = await db.cardpricehistory.find_many(
-                where={
-                    "cardPrintingId": {"in": uncovered_ids},
-                    "provider": "cardmarket",
-                    "recordedAt": {"gte": start_date - timedelta(days=2)},
-                },
-                order={"recordedAt": "asc"},
-            )
-            for h in legacy_histories:
-                by_printing.setdefault(h.cardPrintingId, []).append({
-                    "recordedAt": h.recordedAt if getattr(h.recordedAt, "tzinfo", None) else h.recordedAt.replace(tzinfo=timezone.utc),
-                    "trendPrice": h.trendPrice,
-                })
-
-        # Generate daily points from start_date to today
         num_days = max(1, days if days > 0 else 30)
-        daily_points: List[CollectionValueHistoryPoint] = []
+        start_date = (now - timedelta(days=num_days)).date()
+        end_date = now.date()
 
+        # Aggregate daily totals in SQL (finish=0 = non-foil Cardmarket series).
+        qty_rows = [{"id": pid, "qty": qty} for pid, qty in card_qty_map.items()]
+        daily_map: Dict[str, float] = {}
+        try:
+            import json as _json
+            rows = await db.query_raw(
+                """
+                WITH qtys AS (
+                  SELECT id, qty
+                  FROM jsonb_to_recordset($1::jsonb) AS x(id text, qty int)
+                ),
+                days AS (
+                  SELECT generate_series($2::date, $3::date, interval '1 day')::date AS d
+                ),
+                series AS (
+                  SELECT
+                    h.scryfall_id,
+                    h.date::date AS d,
+                    h.price_cents,
+                    LEAD(h.date::date) OVER (
+                      PARTITION BY h.scryfall_id ORDER BY h.date
+                    ) AS next_d
+                  FROM cm_price_history h
+                  JOIN qtys q ON q.id = h.scryfall_id
+                  WHERE h.finish = 0
+                    AND h.date BETWEEN ($2::date - 7) AND $3::date
+                )
+                SELECT days.d::text AS day,
+                       ROUND(SUM(q.qty * COALESCE(s.price_cents, 0) / 100.0)::numeric, 2) AS total
+                FROM days
+                CROSS JOIN qtys q
+                LEFT JOIN series s
+                  ON s.scryfall_id = q.id
+                 AND s.d <= days.d
+                 AND (s.next_d IS NULL OR s.next_d > days.d)
+                GROUP BY days.d
+                ORDER BY days.d
+                """,
+                _json.dumps(qty_rows),
+                start_date.isoformat(),
+                end_date.isoformat(),
+            )
+            for row in rows or []:
+                day = row.get("day")
+                if day:
+                    daily_map[str(day)[:10]] = float(row.get("total") or 0.0)
+        except Exception:
+            logger.warning("collection value history SQL aggregate failed; using current value", exc_info=True)
+
+        daily_points: List[CollectionValueHistoryPoint] = []
         for i in range(num_days + 1):
             day_dt = start_date + timedelta(days=i)
-            day_str = day_dt.strftime("%Y-%m-%d")
-            total_day_value = 0.0
-
-            for pid, qty in card_qty_map.items():
-                pts = by_printing.get(pid, [])
-                matching = [p for p in pts if p["recordedAt"] <= day_dt]
-                if matching and matching[-1]["trendPrice"] is not None:
-                    p_val = float(matching[-1]["trendPrice"])
-                elif pts and pts[0]["trendPrice"] is not None:
-                    p_val = float(pts[0]["trendPrice"])
-                else:
-                    p_val = current_card_prices.get(pid, 0.0)
-                total_day_value += p_val * qty
-
+            day_str = day_dt.isoformat()
+            total_day_value = daily_map.get(day_str)
+            if total_day_value is None or total_day_value <= 0:
+                total_day_value = current_val
             daily_points.append(
                 CollectionValueHistoryPoint(
                     date=day_str,
-                    totalValue=round(total_day_value, 2),
+                    totalValue=round(float(total_day_value), 2),
                     ownedCards=total_owned,
                 )
             )

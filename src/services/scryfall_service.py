@@ -539,12 +539,22 @@ class ScryfallService:
     async def _get_cached_card_details(
         card_id: Optional[str], name: Optional[str]
     ) -> Optional[Dict[str, Any]]:
-        """Reads an already-hydrated localized card detail from CardCatalog."""
+        """Reads an already-hydrated localized card detail from CardCatalog.
+
+        The UI often opens the detail dialog with a *printing* id (from movers,
+        collection rows, etc.). Resolve printing → catalog, then fall back to
+        normalized name so we do not miss a warm cache and block on enrichment.
+        """
         try:
             record = None
             if card_id:
                 record = await db.cardcatalog.find_unique(where={"id": card_id})
-            elif name:
+                if record is None:
+                    printing = await db.cardprinting.find_unique(where={"id": card_id})
+                    catalog_id = getattr(printing, "catalogId", None) if printing else None
+                    if catalog_id:
+                        record = await db.cardcatalog.find_unique(where={"id": catalog_id})
+            if record is None and name:
                 normalized_name = normalize_card_name(name)
                 if normalized_name:
                     record = await db.cardcatalog.find_unique(
@@ -669,10 +679,12 @@ class ScryfallService:
         full hydration (Scryfall data, images, prices and rulings) to the worker
         and waits for it to finish. Only falls back to a direct Scryfall call
         when the worker is unreachable.
+
+        Any already-persisted detailsEs payload is returned immediately so the
+        detail dialog never blocks on a slow enrich-card round-trip.
         """
         cached = await ScryfallService._get_cached_card_details(card_id, name)
-        stale_cached = cached
-        if cached and cached.get("cache_version") == 2:
+        if cached:
             logger.info("Card details cache hit for %s", card_id or name)
             return ScryfallService._finalize_cached_details(cached, card_id or name)
 
@@ -686,10 +698,6 @@ class ScryfallService:
                     card_id or name,
                 )
                 return ScryfallService._finalize_cached_details(cached, enriched_id)
-
-        if stale_cached:
-            logger.warning("Returning stale card details after enrichment failed for %s", card_id or name)
-            return ScryfallService._finalize_cached_details(stale_cached, card_id or name)
 
         async with httpx.AsyncClient(headers=SCRYFALL_HEADERS, timeout=12.0) as client:
             card_data: Optional[Dict[str, Any]] = None

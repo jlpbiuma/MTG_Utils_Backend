@@ -1,4 +1,5 @@
 import pytest
+import asyncio
 from httpx import AsyncClient, ASGITransport
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -37,28 +38,106 @@ async def test_scryfall_card_endpoint_mocked():
 
 
 @pytest.mark.asyncio
-async def test_card_details_uses_persisted_cache_before_scryfall():
+async def test_card_details_resolves_printing_id_to_catalog_cache():
+    """Detail dialog opens with a printing id; cache lives on the catalog row."""
     cached_details = {
-        "id": "cached-card",
-        "name": "Carta en caché",
-        "oracle_text_es": "Este resultado procede de PostgreSQL.",
+        "id": "catalog-sol-ring",
+        "name": "Sol Ring",
+        "oracle_text_es": "Añade {C}.",
         "cache_version": 2,
     }
-    catalog = SimpleNamespace(detailsEs=cached_details)
+    printing = SimpleNamespace(id="printing-sol-ring", catalogId="catalog-sol-ring")
+    catalog = SimpleNamespace(id="catalog-sol-ring", detailsEs=cached_details)
+
+    find_unique_catalog = AsyncMock(side_effect=[None, catalog])
+    find_unique_printing = AsyncMock(return_value=printing)
+    fake_db = SimpleNamespace(
+        cardcatalog=SimpleNamespace(find_unique=find_unique_catalog),
+        cardprinting=SimpleNamespace(find_unique=find_unique_printing),
+    )
+
+    with (
+        patch("src.services.scryfall_service.db", new=fake_db),
+        patch.object(
+            ScryfallService,
+            "enrich_card_via_worker",
+            new=AsyncMock(side_effect=AssertionError("must not block on worker")),
+        ),
+    ):
+        result = await ScryfallService.get_card_details_es(
+            card_id="printing-sol-ring", name="Sol Ring"
+        )
+
+    assert result["id"] == "catalog-sol-ring"
+    find_unique_printing.assert_awaited_once_with(where={"id": "printing-sol-ring"})
+
+
+@pytest.mark.asyncio
+async def test_card_details_falls_back_to_name_when_id_not_in_catalog():
+    cached_details = {
+        "id": "catalog-sol-ring",
+        "name": "Sol Ring",
+        "cache_version": 2,
+    }
+    catalog = SimpleNamespace(id="catalog-sol-ring", detailsEs=cached_details)
+    find_unique_catalog = AsyncMock(side_effect=[None, catalog])
+    find_unique_printing = AsyncMock(return_value=None)
+    fake_db = SimpleNamespace(
+        cardcatalog=SimpleNamespace(find_unique=find_unique_catalog),
+        cardprinting=SimpleNamespace(find_unique=find_unique_printing),
+    )
+
+    with (
+        patch("src.services.scryfall_service.db", new=fake_db),
+        patch.object(
+            ScryfallService,
+            "enrich_card_via_worker",
+            new=AsyncMock(side_effect=AssertionError("must not block on worker")),
+        ),
+    ):
+        result = await ScryfallService.get_card_details_es(
+            card_id="unknown-printing", name="Sol Ring"
+        )
+
+    assert result["id"] == "catalog-sol-ring"
+    assert find_unique_catalog.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_card_details_returns_stale_cache_without_waiting_for_worker():
+    """Stale detailsEs must not block the UI on a 90s enrich-card call."""
+    stale = {
+        "id": "catalog-sol-ring",
+        "name": "Sol Ring",
+        "oracle_text_es": "Add {C}.",
+        # No cache_version 2 → previously treated as miss and blocked on worker
+    }
+
+    async def slow_enrich(*_args, **_kwargs):
+        await asyncio.sleep(5)
+        return "catalog-sol-ring"
 
     with (
         patch.object(
             ScryfallService,
             "_get_cached_card_details",
-            new=AsyncMock(return_value=cached_details),
-        ) as get_cached,
-        patch("src.services.scryfall_service.httpx.AsyncClient") as http_client,
+            new=AsyncMock(return_value=stale),
+        ),
+        patch.object(
+            ScryfallService,
+            "enrich_card_via_worker",
+            new=AsyncMock(side_effect=slow_enrich),
+        ) as enrich,
     ):
-        result = await ScryfallService.get_card_details_es(card_id="cached-card")
+        started = asyncio.get_event_loop().time()
+        result = await ScryfallService.get_card_details_es(
+            card_id="catalog-sol-ring", name="Sol Ring"
+        )
+        elapsed = asyncio.get_event_loop().time() - started
 
-    assert result == cached_details
-    get_cached.assert_awaited_once_with("cached-card", None)
-    http_client.assert_not_called()
+    assert result["name"] == "Sol Ring"
+    assert elapsed < 1.0
+    enrich.assert_not_awaited()
 
 
 @pytest.mark.asyncio

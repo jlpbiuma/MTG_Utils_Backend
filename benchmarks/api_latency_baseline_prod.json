@@ -1,0 +1,207 @@
+{
+  "schema": "api_latency_v1",
+  "measured_at": "2026-09-24T15:28:48.152887+00:00",
+  "base": "http://192.168.0.4:8000",
+  "user_id": "88da13c0-ac6a-43b5-be2b-7a9b39ccfec7",
+  "runs": 5,
+  "endpoints": {
+    "health": {
+      "n": 5,
+      "mean_ms": 12.2,
+      "median_ms": 8.2,
+      "p95_ms": 27.2,
+      "min_ms": 6.7,
+      "max_ms": 27.2,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 57,
+      "path": "/api/health",
+      "method": "GET"
+    },
+    "decks": {
+      "n": 5,
+      "mean_ms": 1316.0,
+      "median_ms": 987.0,
+      "p95_ms": 2800.0,
+      "min_ms": 874.4,
+      "max_ms": 2800.0,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 61052,
+      "path": "/api/decks",
+      "method": "GET"
+    },
+    "deck_detail": {
+      "n": 5,
+      "mean_ms": 923.4,
+      "median_ms": 937.3,
+      "p95_ms": 978.0,
+      "min_ms": 814.9,
+      "max_ms": 978.0,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 158678,
+      "path": "/api/decks/39b38342-1df5-4c1a-b8d9-ad68977c013b",
+      "method": "GET"
+    },
+    "deck_view": {
+      "n": 5,
+      "mean_ms": 68.8,
+      "median_ms": 66.9,
+      "p95_ms": 76.3,
+      "min_ms": 65.2,
+      "max_ms": 76.3,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 55134,
+      "path": "/api/decks/39b38342-1df5-4c1a-b8d9-ad68977c013b/view?provider=cardmarket",
+      "method": "GET"
+    },
+    "collection_query": {
+      "n": 5,
+      "mean_ms": 2332.9,
+      "median_ms": 1682.7,
+      "p95_ms": 5149.9,
+      "min_ms": 1463.8,
+      "max_ms": 5149.9,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 4311180,
+      "path": "/api/collection/query",
+      "method": "GET"
+    },
+    "wants_query": {
+      "n": 5,
+      "mean_ms": 905.9,
+      "median_ms": 904.9,
+      "p95_ms": 966.0,
+      "min_ms": 830.5,
+      "max_ms": 966.0,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 78993,
+      "path": "/api/wants/query",
+      "method": "GET"
+    },
+    "priorities": {
+      "n": 5,
+      "mean_ms": 1665.2,
+      "median_ms": 1037.4,
+      "p95_ms": 4315.9,
+      "min_ms": 887.3,
+      "max_ms": 4315.9,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 290989,
+      "path": "/api/priorities?page=1&limit=100",
+      "method": "GET"
+    },
+    "scryfall_search": {
+      "n": 5,
+      "mean_ms": 248.0,
+      "median_ms": 245.4,
+      "p95_ms": 264.4,
+      "min_ms": 236.9,
+      "max_ms": 264.4,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 1039,
+      "path": "/api/scryfall/search?q=sol+ring&limit=15",
+      "method": "GET"
+    },
+    "pricing_collection": {
+      "n": 5,
+      "mean_ms": 458.3,
+      "median_ms": 437.8,
+      "p95_ms": 521.8,
+      "min_ms": 400.1,
+      "max_ms": 521.8,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 3293048,
+      "path": "/api/pricing",
+      "method": "POST"
+    },
+    "pricing_collection_history": {
+      "n": 5,
+      "mean_ms": 577.5,
+      "median_ms": 551.5,
+      "p95_ms": 719.4,
+      "min_ms": 515.6,
+      "max_ms": 719.4,
+      "status_codes": [
+        500,
+        500,
+        500,
+        500,
+        500
+      ],
+      "median_bytes": 21,
+      "path": "/api/pricing/collection/history?days=30",
+      "method": "GET"
+    },
+    "whatsapp_matches": {
+      "n": 5,
+      "mean_ms": 8.7,
+      "median_ms": 9.3,
+      "p95_ms": 9.6,
+      "min_ms": 7.6,
+      "max_ms": 9.6,
+      "status_codes": [
+        200,
+        200,
+        200,
+        200,
+        200
+      ],
+      "median_bytes": 144,
+      "path": "/api/whatsapp/matches",
+      "method": "GET"
+    }
+  }
+}

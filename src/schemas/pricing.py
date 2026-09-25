@@ -150,6 +150,7 @@ class CardExpansionRelease(BaseModel):
     collectorNumber: Optional[str] = None
     printingId: Optional[str] = None
     trendPrice: Optional[float] = None
+    hasPrinting: Optional[bool] = False
 
 
 class PrintingPriceSeries(BaseModel):
