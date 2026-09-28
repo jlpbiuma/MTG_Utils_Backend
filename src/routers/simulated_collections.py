@@ -6,6 +6,8 @@ from src.schemas.simulated_collections import (
     SimulatedCollectionAnalysisResponse,
     SimulatedCollectionCreateRequest,
     SimulatedCollectionAnalyzeRequest,
+    SimulatedCardVersionRequest,
+    SimulatedCollectionCardRequest,
 )
 from src.services.simulated_collection_service import SimulatedCollectionService
 
@@ -22,6 +24,7 @@ async def analyze_raw_collection(
         raw_text=payload.rawText,
         name="Análisis Temporal",
         provider=payload.provider,
+        printing_overrides=payload.printingOverrides,
     )
 
 @router.post("", response_model=SimulatedCollectionAnalysisResponse)
@@ -39,6 +42,7 @@ async def create_simulated_collection(
         description=payload.description,
         raw_text=payload.rawText,
         provider=provider,
+        printing_overrides=payload.printingOverrides,
     )
 
 @router.get("", response_model=List[SimulatedCollectionSummary])
@@ -81,3 +85,39 @@ async def delete_simulated_collection(
     if not success:
         raise HTTPException(status_code=404, detail="Colección simulada no encontrada.")
     return {"status": "deleted", "id": collection_id}
+
+
+@router.put("/{collection_id}/card-version", response_model=SimulatedCollectionAnalysisResponse)
+async def update_simulated_card_version(
+    collection_id: str,
+    payload: SimulatedCardVersionRequest,
+    provider: str = Query("cardmarket"),
+    user_id: str = Depends(get_current_user_id),
+):
+    return await SimulatedCollectionService.update_card_version(
+        user_id, collection_id, payload.cardName, payload.printingId, provider,
+    )
+
+
+@router.post("/{collection_id}/cards", response_model=SimulatedCollectionAnalysisResponse)
+async def add_simulated_collection_card(
+    collection_id: str,
+    payload: SimulatedCollectionCardRequest,
+    provider: str = Query("cardmarket"),
+    user_id: str = Depends(get_current_user_id),
+):
+    return await SimulatedCollectionService.mutate_card(
+        user_id, collection_id, payload.cardName, provider, "add", payload.quantity,
+    )
+
+
+@router.delete("/{collection_id}/cards", response_model=SimulatedCollectionAnalysisResponse)
+async def remove_simulated_collection_card(
+    collection_id: str,
+    payload: SimulatedCollectionCardRequest,
+    provider: str = Query("cardmarket"),
+    user_id: str = Depends(get_current_user_id),
+):
+    return await SimulatedCollectionService.mutate_card(
+        user_id, collection_id, payload.cardName, provider, "remove",
+    )

@@ -1,10 +1,12 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Optional
+from datetime import datetime, time, timezone
 from src.core.auth import get_current_user_id
 from src.schemas.collection import (
     CollectionCardCreate, CollectionCardUpdate, CollectionCardUpdateVersion,
     CollectionCardResponse, CollectionStats, CollectionQueryResponse,
     DormantCardsResponse,
+    CollectionAcquisitionDateUpdate,
 )
 from src.services.collection_service import CollectionService
 from src.services.collection_view_service import CollectionViewService
@@ -75,6 +77,19 @@ async def update_collection_quantity(
     return res
 
 
+@router.patch("/{card_id}/acquired-at", response_model=CollectionCardResponse)
+async def update_collection_acquired_at(
+    card_id: str,
+    data: CollectionAcquisitionDateUpdate,
+    user_id: str = Depends(get_current_user_id),
+):
+    acquired_at = datetime.combine(data.acquiredAt, time.min, tzinfo=timezone.utc)
+    res = await CollectionService.update_acquired_at(user_id, card_id, acquired_at)
+    if not res:
+        raise HTTPException(status_code=404, detail="Carta no encontrada en la colección")
+    return res
+
+
 @router.patch("/{card_id}/version", response_model=CollectionCardResponse)
 async def update_collection_card_version(
     card_id: str,
@@ -117,4 +132,3 @@ async def get_dormant_cards(
         min_price=minPrice,
         provider=provider,
     )
-

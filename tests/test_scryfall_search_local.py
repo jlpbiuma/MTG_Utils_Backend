@@ -153,3 +153,24 @@ async def test_autocomplete_cards_local_first():
         names = await ScryfallService.autocomplete_cards("Light")
         assert names == ["Lightning Bolt", "Lightning Helix"]
         httpx_mock.assert_not_called()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query,name", [("Light", "Lightning Bolt"), ("yshto", "Y'shtola, Night's Blessed"), ("anillo", "Sol Ring")])
+async def test_interactive_search_returns_partial_or_spanish_local_match_without_network(query, name):
+    with patch.object(ScryfallService, "search_cards_local", AsyncMock(return_value=[{"id": "c1", "name": name}])), \
+         patch("src.services.scryfall_service.httpx.AsyncClient") as client:
+        result = await ScryfallService.search_cards(query, prefer_local=True)
+    assert result["source"] == "local"
+    assert result["data"][0]["name"] == name
+    client.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query,page,prefer_local", [("Light", 1, False), ("Light", 2, True), ("t:creature", 1, True)])
+async def test_partial_search_keeps_live_fallback_for_default_pagination_and_syntax(query, page, prefer_local):
+    response = MagicMock(status_code=404)
+    client = make_fake_scryfall_client(response)
+    with patch.object(ScryfallService, "search_cards_local", AsyncMock(return_value=[{"id": "c1", "name": "Lightning Bolt"}])), \
+         patch("src.services.scryfall_service.httpx.AsyncClient", client):
+        await ScryfallService.search_cards(query, page, prefer_local=prefer_local)
+    client.return_value.get.assert_awaited_once()

@@ -1,0 +1,415 @@
+&#x9;Name	Info.	Price
+
+1x	The Eldest Reborn&#x9;
+
+\#90
+
+NM
+
+0,45 €
+
+1x	Izoni, Thousand-Eyed&#x9;
+
+\#180
+
+NM
+
+003
+
+0,26 €
+
+1x	Flux Channeler&#x9;
+
+\#52
+
+NM
+
+2,70 €
+
+1x	Contentious Plan&#x9;
+
+\#46
+
+NM
+
+0,46 €
+
+1x	Jace, Architect of Thought&#x9;
+
+\#114
+
+NM
+
+006
+
+0,23 €
+
+1x	Dakkon, Shadow Slayer (V.2)&#x9;
+
+\#363
+
+NM
+
+004
+
+0,75 €
+
+1x	Gideon Jura&#x9;
+
+\#24
+
+NM
+
+006
+
+0,21 €
+
+1x	Reject Imperfection&#x9;
+
+\#67
+
+NM
+
+pirexia
+
+0,22 €
+
+1x	Serum Snare&#x9;
+
+\#68
+
+NM
+
+005
+
+0,32 €
+
+1x	Experimental Augury&#x9;
+
+\#49
+
+NM
+
+005
+
+0,35 €
+
+1x	Nahiri, the Harbinger&#x9;
+
+\#929
+
+NM
+
+006
+
+0,34 €
+
+1x	Narset, Parter of Veils&#x9;
+
+\#853
+
+NM
+
+005
+
+1,66 €
+
+1x	Three Blind Mice&#x9;
+
+\#35
+
+NM
+
+004
+
+0,58 €
+
+1x	Vraska Joins Up&#x9;
+
+\#236
+
+NM
+
+007
+
+0,59 €
+
+1x	Tezzeret's Gambit&#x9;
+
+\#194
+
+NM
+
+005
+
+0,32 €
+
+1x	Arasta of the Endless Web&#x9;
+
+\#244
+
+NM
+
+005
+
+0,50 €
+
+1x	From Father to Son&#x9;
+
+\#20
+
+NM
+
+007
+
+0,20 €
+
+1x	Jecht, Reluctant Guardian // Braska's Final Aeon&#x9;
+
+\#104
+
+NM
+
+007
+
+0,29 €
+
+1x	Kilo, Apogee Mind&#x9;
+
+\#3
+
+NM
+
+2,37 €
+
+1x	Binding the Old Gods&#x9;
+
+\#52
+
+NM
+
+0,43 €
+
+1x	Radioactive Spider&#x9;
+
+\#111
+
+NM
+
+0,22 €
+
+1x	Spider-Man 2099&#x9;
+
+\#150
+
+NM
+
+007
+
+0,40 €
+
+1x	Secret of Bloodbending&#x9;
+
+\#69
+
+NM
+
+007
+
+1,16 €
+
+1x	Hakoda, Selfless Commander&#x9;
+
+\#23
+
+NM
+
+004
+
+0,34 €
+
+1x	Yue, the Moon Spirit&#x9;
+
+\#83
+
+NM
+
+004
+
+0,34 €
+
+1x	Iroh, Grand Lotus&#x9;
+
+\#227
+
+NM
+
+005
+
+0,32 €
+
+1x	Katara, Water Tribe's Hope&#x9;
+
+\#231
+
+NM
+
+007
+
+0,20 €
+
+1x	Sokka, Tenacious Tactician&#x9;
+
+\#242
+
+NM
+
+005
+
+0,53 €
+
+1x	Energybending&#x9;
+
+\#2
+
+NM
+
+005
+
+0,29 €
+
+1x	Enter the Avatar State&#x9;
+
+\#18
+
+NM
+
+0,48 €
+
+1x	Haru, Hidden Talent&#x9;
+
+\#182
+
+NM
+
+0,20 €
+
+1x	Shared Roots&#x9;
+
+\#196
+
+NM
+
+005
+
+0,77 €
+
+1x	Uncle Iroh&#x9;
+
+\#248
+
+NM
+
+0,22 €
+
+1x	Glissa Sunslayer&#x9;
+
+\#122
+
+NM
+
+007
+
+0,29 €
+
+1x	Agent Bishop, Man in Black&#x9;
+
+\#2
+
+NM
+
+0,32 €
+
+1x	Mikey & Don, Party Planners&#x9;
+
+\#157
+
+NM
+
+0,51 €
+
+1x	Raph & Leo, Sibling Rivals&#x9;
+
+\#166
+
+NM
+
+1,45 €
+
+1x	Starfield Mystic&#x9;
+
+\#177
+
+NM
+
+0,33 €
+
+1x	Captain Marvel, Earth's Protector&#x9;
+
+\#11
+
+NM
+
+marvel collector
+
+1,97 €
+
+1x	Agent Phil Coulson&#x9;
+
+\#4
+
+NM
+
+marvel collector
+
+0,20 €
+
+1x	Hawkeye, Master Marksman&#x9;
+
+\#130
+
+NM
+
+marvel collector
+
+0,59 €
+
+1x	Daredevil, Man Without Fear&#x9;
+
+\#213
+
+NM
+
+marvel collector
+
+0,41 €
+
+1x	Invisible Woman, Sue Storm&#x9;
+
+\#17
+
+NM
+
+marvel collector
+
+0,20 €
+
+1x	Human Torch, Johnny Storm&#x9;
+
+\#136
+
+NM
+
+marvel collector
+
+0,20 €

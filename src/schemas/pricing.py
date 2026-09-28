@@ -101,6 +101,17 @@ class CardPrintingResponse(BaseModel):
     priceCardmarketTrend: Optional[float] = None
     priceCardmarketMin: Optional[float] = None
     priceCardmarketMax: Optional[float] = None
+    priceTrendAbsoluteChange: Optional[float] = None
+    priceTrendPercentageChange: Optional[float] = None
+    cardName: Optional[str] = None
+    typeLine: Optional[str] = None
+    manaCost: Optional[str] = None
+    isOwned: bool = False
+    ownedQuantity: int = 0
+    collectionCardId: Optional[str] = None
+    acquiredAt: Optional[datetime] = None
+    acquisitionTrendAbsoluteChange: Optional[float] = None
+    acquisitionTrendPercentageChange: Optional[float] = None
 
 class CardSetResponse(BaseModel):
     code: str
@@ -108,6 +119,27 @@ class CardSetResponse(BaseModel):
     setType: str
     cardCount: int
     releasedAt: Optional[datetime] = None
+    iconSvgUri: Optional[str] = None
+    ownedCount: int = 0
+    completionPercentage: int = 0
+    totalValueEur: float = 0.0
+    ownedValueEur: float = 0.0
+
+
+class ExpansionValueHistoryPoint(BaseModel):
+    date: str
+    totalValue: float
+    ownedValue: float
+
+
+class ExpansionValueHistoryResponse(BaseModel):
+    setCode: str
+    windowDays: int
+    currency: str = "EUR"
+    currencySymbol: str = "€"
+    currentTotalValue: float
+    currentOwnedValue: float
+    points: List[ExpansionValueHistoryPoint] = []
 
 
 MoversScope = Literal["global", "collection", "wants"]
@@ -187,4 +219,3 @@ class CollectionValueHistoryResponse(BaseModel):
     currencySymbol: str
     currentValue: float
     points: List[CollectionValueHistoryPoint] = []
-

@@ -1,0 +1,11 @@
+### Magic the Gathering Singles (5)
+
+Sort by...Amount (lowest first)Amount (highest first)Name (A to Z)Name (Z to A)Expansion (oldest first)Expansion (newest first)Expansion (A-Z)Expansion (Z-A)Rarity (most common first)Rarity (rarest first)Condition (best first)Condition (worst first)LanguagePrice (cheapest first)Price (most expensive first)Comment (A-Z)Comment (Z-A)
+
+| NameInfo.Price |   |    | | | | |
+| -------------- | - | -- | --- | ---- | --- | --- |
+| | | 1x | [**Hero of Precinct One**](https://www.cardmarket.com/en/Magic/Products/Singles/Ravnica-Allegiance/Hero-of-Precinct-One) | #11 | [**EX**](https://help.cardmarket.com/en/CardCondition) | 0,15 € |
+| | | 1x | [**Nicol Bolas, Dragon-God**](https://www.cardmarket.com/en/Magic/Products/Singles/War-of-the-Spark/Nicol-Bolas-Dragon-God) | #207 | [**EX**](https://help.cardmarket.com/en/CardCondition) | 2,00 € |
+| | | 1x | [**General Ferrous Rokiric**](https://www.cardmarket.com/en/Magic/Products/Singles/Modern-Horizons-2/General-Ferrous-Rokiric) | #198 | [**EX**](https://help.cardmarket.com/en/CardCondition) | 0,30 € |
+| | | 1x | [**Shadowheart, Dark Justiciar**](https://www.cardmarket.com/en/Magic/Products/Singles/Commander-Legends-Battle-for-Baldurs-Gate/Shadowheart-Dark-Justiciar) | #146 | [**NM**](https://help.cardmarket.com/en/CardCondition) | 0,90 € |
+| | | 1x | [**Eureka Moment**](https://www.cardmarket.com/en/Magic/Products/Singles/Commander-Modern-Horizons-3/Eureka-Moment) | #260 | [**NM**](https://help.cardmarket.com/en/CardCondition) | 0,10 €<br><br><br> |

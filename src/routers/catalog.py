@@ -1,9 +1,12 @@
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as datetime_time
+from collections import defaultdict
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Response
+from src.core.auth import get_current_user_id
+from fastapi import Depends
 
 from src.core.db import db
 from src.schemas.pricing import (
@@ -14,8 +17,12 @@ from src.schemas.pricing import (
     CardPriceHistoryResponse,
     PrintingPriceSeries,
     CardExpansionRelease,
+    ExpansionValueHistoryResponse,
 )
+from src.schemas.collection import CollectionAcquisitionDateUpdate
 from src.services.pricing_service import PRICE_PROVIDERS
+from src.services.price_trends import calculate_price_trend, calculate_price_change_since
+from src.services.card_utils import normalize_card_name
 
 logger = logging.getLogger(__name__)
 
@@ -115,26 +122,305 @@ def clear_price_history_cache():
 
 
 @router.get("/sets", response_model=list[CardSetResponse])
-async def list_sets(limit: int = Query(100, ge=1, le=500)):
-    return await db.cardset.find_many(take=limit, order={"releasedAt": "desc"})
+async def list_sets(limit: int = Query(2000, ge=1, le=2000), user_id: str = Depends(get_current_user_id)):
+    sets = await db.cardset.find_many(take=limit, order={"releasedAt": "desc"})
+    rows = await db.collectioncard.find_many(where={"userId": user_id, "setCode": {"not": None}})
+    value_by_set: dict[str, tuple[float, float]] = {}
+    counts_by_set: dict[str, tuple[int, int]] = {}
+    if hasattr(db, "query_raw"):
+        try:
+            value_rows = await db.query_raw("""
+                SELECT s.code,
+                       COUNT(DISTINCT p.id)::int AS "cardCount",
+                       COUNT(DISTINCT p.id) FILTER (WHERE COALESCE(owned.quantity, 0) > 0)::int AS "ownedCount",
+                       COALESCE(SUM(COALESCE(p.price_cardmarket_trend, p.price_eur, 0)), 0)::float AS "totalValueEur",
+                       COALESCE(SUM(COALESCE(p.price_cardmarket_trend, p.price_eur, 0) * COALESCE(owned.quantity, 0)), 0)::float AS "ownedValueEur"
+                FROM card_sets s
+                LEFT JOIN card_printings p ON p.set_id = s.id
+                LEFT JOIN LATERAL (
+                    SELECT SUM(c.quantity)::int AS quantity
+                    FROM user_collections c
+                    WHERE c.user_id = $1 AND (
+                        (lower(c.set_code) = lower(s.code) AND lower(c.collector_number) = lower(p.collector_number))
+                        OR lower(c.card_scryfall_id) = lower(p.id)
+                        OR (p.catalog_id IS NOT NULL AND lower(c.card_scryfall_id) = lower(p.catalog_id))
+                        OR lower(regexp_replace(btrim(split_part(c.card_name, '/', 1)), '[[:space:]]+', ' ', 'g')) =
+                           lower(regexp_replace(btrim(split_part((SELECT name FROM card_catalog WHERE id = p.catalog_id), '/', 1)), '[[:space:]]+', ' ', 'g'))
+                    )
+                ) owned ON true
+                GROUP BY s.code
+            """, user_id)
+            value_by_set = {
+                str(row["code"]).lower(): (float(row.get("totalValueEur") or 0), float(row.get("ownedValueEur") or 0))
+                for row in (value_rows or [])
+            }
+            counts_by_set = {
+                str(row["code"]).lower(): (int(row.get("cardCount") or 0), int(row.get("ownedCount") or 0))
+                for row in (value_rows or [])
+            }
+        except Exception:
+            logger.exception("Unable to aggregate expansion values")
+    owned_by_set: dict[str, set[str]] = {}
+    for row in rows:
+        code = (getattr(row, "setCode", None) or "").lower()
+        number = (getattr(row, "collectorNumber", None) or "").casefold()
+        if code and number:
+            owned_by_set.setdefault(code, set()).add(number)
+    result = []
+    for card_set in sets:
+        code = getattr(card_set, "code", "") or ""
+        fallback_owned = len(owned_by_set.get(code.lower(), set()))
+        count, owned = counts_by_set.get(
+            code.lower(),
+            (max(getattr(card_set, "cardCount", 0) or 0, 0), fallback_owned),
+        )
+        total_value, owned_value = value_by_set.get(code.lower(), (0.0, 0.0))
+        result.append({
+            "code": code,
+            "name": getattr(card_set, "name", "") or code.upper(),
+            "setType": getattr(card_set, "setType", "unknown"),
+            "cardCount": count,
+            "releasedAt": getattr(card_set, "releasedAt", None),
+            "iconSvgUri": getattr(card_set, "iconSvgUri", None),
+            "ownedCount": owned,
+            "completionPercentage": round(min(owned, count) * 100 / count) if count else 0,
+            "totalValueEur": round(total_value, 2),
+            "ownedValueEur": round(owned_value, 2),
+        })
+    return result
+
+
+@router.get("/sets/{set_code}/value-history", response_model=ExpansionValueHistoryResponse)
+async def set_value_history(
+    set_code: str,
+    days: int = Query(7, ge=1, le=365),
+    user_id: str = Depends(get_current_user_id),
+):
+    code = set_code.lower()
+    set_obj = await db.cardset.find_unique(where={"code": code})
+    if not set_obj:
+        raise HTTPException(status_code=404, detail="Edición no encontrada")
+    printings = await db.cardprinting.find_many(
+        where={"setId": set_obj.id}, take=10000, include={"catalog": True}
+    )
+    owned_rows = await db.collectioncard.find_many(where={"userId": user_id})
+    owned_by_identity: dict[str, int] = {}
+    for row in owned_rows:
+        quantity = getattr(row, "quantity", 0) or 0
+        name = getattr(row, "cardName", None)
+        card_id = getattr(row, "cardScryfallId", None)
+        set_code_owned = getattr(row, "setCode", None)
+        collector_number = getattr(row, "collectorNumber", None)
+        if name:
+            key = f"name:{normalize_card_name(name)}"
+            owned_by_identity[key] = owned_by_identity.get(key, 0) + quantity
+        if card_id:
+            key = f"id:{card_id.casefold()}"
+            owned_by_identity[key] = owned_by_identity.get(key, 0) + quantity
+        if set_code_owned and collector_number:
+            key = f"printing:{set_code_owned.casefold()}:{collector_number.casefold()}"
+            owned_by_identity[key] = owned_by_identity.get(key, 0) + quantity
+    quantities: dict[str, int] = {}
+    for printing in printings:
+        catalog = getattr(printing, "catalog", None)
+        keys = [f"id:{printing.id.casefold()}"]
+        if getattr(printing, "catalogId", None):
+            keys.append(f"id:{printing.catalogId.casefold()}")
+        if getattr(catalog, "name", None):
+            keys.append(f"name:{normalize_card_name(catalog.name)}")
+        keys.append(f"printing:{code}:{(getattr(printing, 'collectorNumber', '') or '').casefold()}")
+        quantities[printing.id] = max((owned_by_identity.get(key, 0) for key in keys), default=0)
+
+    now = datetime.now(timezone.utc)
+    start_date = (now - timedelta(days=days)).date()
+    history_start = datetime.combine(start_date - timedelta(days=30), datetime.min.time(), tzinfo=timezone.utc)
+    model = getattr(db, "cmpricehistory", None)
+    histories = []
+    if model is not None and printings:
+        histories = await model.find_many(
+            where={"scryfallId": {"in": [p.id for p in printings]}, "finish": 0, "date": {"gte": history_start}},
+            order={"date": "asc"},
+        )
+    by_printing: dict[str, list[tuple[Any, float]]] = defaultdict(list)
+    for item in histories:
+        by_printing[item.scryfallId].append((getattr(item, "date"), float(item.priceCents) / 100))
+    points = []
+    current_total = current_owned = 0.0
+    for printing in printings:
+        latest = getattr(printing, "priceCardmarketTrend", None)
+        if latest is None:
+            latest = getattr(printing, "priceEur", None)
+        latest = float(latest or 0)
+        current_total += latest
+        current_owned += latest * quantities.get(printing.id, 0)
+    chart_days = [start_date + timedelta(days=offset) for offset in range(days + 1)]
+    day_prices: dict[str, list[float]] = {}
+    for printing in printings:
+        series = by_printing.get(printing.id, [])
+        historical_price = None
+        position = 0
+        fallback = getattr(printing, "priceCardmarketTrend", None)
+        if fallback is None:
+            fallback = getattr(printing, "priceEur", None)
+        prices = []
+        for day in chart_days:
+            while position < len(series):
+                observed, price = series[position]
+                observed_date = observed.date() if isinstance(observed, datetime) else observed
+                if observed_date > day:
+                    break
+                historical_price = price
+                position += 1
+            prices.append(float(historical_price if historical_price is not None else (fallback or 0)))
+        if chart_days[-1] == now.date():
+            prices[-1] = float(fallback or prices[-1])
+        day_prices[printing.id] = prices
+    for offset, day in enumerate(chart_days):
+        total = owned = 0.0
+        for printing in printings:
+            historical_price = day_prices[printing.id][offset]
+            total += historical_price
+            owned += historical_price * quantities.get(printing.id, 0)
+        points.append({"date": day.isoformat(), "totalValue": round(total, 2), "ownedValue": round(owned, 2)})
+    return {
+        "setCode": code, "windowDays": days, "currentTotalValue": round(current_total, 2),
+        "currentOwnedValue": round(current_owned, 2), "points": points,
+    }
 
 
 @router.get("/sets/{set_code}/cards", response_model=list[CardPrintingResponse])
-async def set_cards(set_code: str):
-    set_obj = await db.cardset.find_unique(where={"code": set_code.lower()})
+async def set_cards(set_code: str, user_id: str = Depends(get_current_user_id)):
+    code = set_code.lower()
+    set_obj = await db.cardset.find_unique(where={"code": code})
     if not set_obj:
         raise HTTPException(status_code=404, detail="Edición no encontrada")
 
     printings = await db.cardprinting.find_many(
         where={"setId": set_obj.id},
-        take=250,
+        take=10000,
         order={"collectorNumber": "asc"},
+        include={"catalog": True},
     )
-    return [
-        {
+    # Collection records can point at a different printing (or omit set data
+    # after import). Treat any owned printing of the same catalog card as owned.
+    owned_rows = await db.collectioncard.find_many(where={"userId": user_id})
+    owned_by_identity: dict[str, int] = {}
+    rows_by_identity: dict[str, list[Any]] = defaultdict(list)
+    for row in owned_rows:
+        card_name = getattr(row, "cardName", None)
+        card_id = getattr(row, "cardScryfallId", None)
+        owned_set = getattr(row, "setCode", None)
+        owned_number = getattr(row, "collectorNumber", None)
+        quantity = getattr(row, "quantity", 0) or 0
+        if card_name:
+            key = f"name:{normalize_card_name(card_name)}"
+            owned_by_identity[key] = owned_by_identity.get(key, 0) + quantity
+            rows_by_identity[key].append(row)
+        if card_id:
+            key = f"id:{card_id.casefold()}"
+            owned_by_identity[key] = owned_by_identity.get(key, 0) + quantity
+            rows_by_identity[key].append(row)
+        if owned_set and owned_number:
+            key = f"printing:{owned_set.casefold()}:{owned_number.casefold()}"
+            owned_by_identity[key] = owned_by_identity.get(key, 0) + quantity
+            rows_by_identity[key].append(row)
+    acquisition_by_printing: dict[str, tuple[Optional[str], Optional[datetime]]] = {}
+    for printing in printings:
+        catalog = getattr(printing, "catalog", None)
+        identities = [
+            (0, f"id:{printing.id.casefold()}"),
+            (1, f"id:{(getattr(printing, 'catalogId', None) or '').casefold()}"),
+            (2, f"printing:{code}:{(getattr(printing, 'collectorNumber', '') or '').casefold()}"),
+        ]
+        if getattr(catalog, "name", None):
+            identities.append((3, f"name:{normalize_card_name(catalog.name)}"))
+        candidates: dict[str, tuple[int, Any]] = {}
+        for priority, key in identities:
+            for row in rows_by_identity.get(key, []):
+                row_id = getattr(row, "id", str(id(row)))
+                previous = candidates.get(row_id)
+                if previous is None or priority < previous[0]:
+                    candidates[row_id] = (priority, row)
+        ordered_candidates = sorted(
+            candidates.values(), key=lambda item: (item[0], -(getattr(item[1], "quantity", 0) or 0))
+        )
+        acquired_row = next((row for _, row in ordered_candidates if getattr(row, "acquiredAt", None)), None)
+        if acquired_row is None and ordered_candidates:
+            acquired_row = ordered_candidates[0][1]
+        acquisition_by_printing[printing.id] = (
+            getattr(acquired_row, "id", None), getattr(acquired_row, "acquiredAt", None)
+        )
+    history_by_printing: dict[str, list[Any]] = defaultdict(list)
+    printing_ids = [printing.id for printing in printings]
+    now = datetime.now(timezone.utc)
+    # Prisma's Python client serializes this @db.Date field through its
+    # DateTime input type, so pass midnight UTC instead of datetime.date.
+    acquisition_dates = [acquired for _, acquired in acquisition_by_printing.values() if acquired is not None]
+    history_start = min(acquisition_dates) if acquisition_dates else now - timedelta(days=60)
+    if history_start.tzinfo is None:
+        history_start = history_start.replace(tzinfo=timezone.utc)
+    history_start = history_start.replace(hour=0, minute=0, second=0, microsecond=0)
+    cm_history_model = getattr(db, "cmpricehistory", None)
+    cm_histories = []
+    if cm_history_model is not None and printing_ids:
+        cm_histories = await cm_history_model.find_many(
+            where={"scryfallId": {"in": printing_ids}, "finish": 0, "date": {"gte": history_start}},
+            order={"date": "asc"},
+        )
+        for history in cm_histories:
+            history_by_printing[history.scryfallId].append(history)
+    missing_history_ids = [printing_id for printing_id in printing_ids if not history_by_printing.get(printing_id)]
+    if missing_history_ids:
+        legacy_history_model = getattr(db, "cardpricehistory", None)
+        if legacy_history_model is not None:
+            legacy_histories = await legacy_history_model.find_many(
+                where={
+                    "cardPrintingId": {"in": missing_history_ids},
+                    "provider": "cardmarket",
+                    "trendPrice": {"not": None},
+                    "recordedAt": {"gte": history_start},
+                },
+                order={"recordedAt": "asc"},
+            )
+            for history in legacy_histories:
+                history_by_printing[history.cardPrintingId].append(history)
+    trend_by_printing = {
+        printing.id: calculate_price_trend(
+            history_by_printing.get(printing.id, []),
+            current_price=getattr(printing, "priceCardmarketTrend", None),
+            current_at=getattr(printing, "pricesUpdatedAt", None),
+            now=now,
+            window_days=7,
+        )
+        for printing in printings
+    }
+    result = []
+    for printing in printings:
+        catalog = getattr(printing, "catalog", None)
+        catalog_id = getattr(printing, "catalogId", None)
+        name = getattr(catalog, "name", None)
+        identities = []
+        if name:
+            identities.append(f"name:{normalize_card_name(name)}")
+        if catalog_id:
+            identities.append(f"id:{catalog_id.casefold()}")
+        identities.append(f"id:{printing.id.casefold()}")
+        identities.append(f"printing:{code}:{(getattr(printing, 'collectorNumber', '') or '').casefold()}")
+        owned_quantity = max((owned_by_identity.get(key, 0) for key in identities), default=0)
+        collection_card_id, acquired_at = acquisition_by_printing.get(printing.id, (None, None))
+        acquisition_trend = (None, None)
+        if acquired_at is not None:
+            acquisition_trend = calculate_price_change_since(
+                history_by_printing.get(printing.id, []),
+                acquired_at=acquired_at,
+                current_price=getattr(printing, "priceCardmarketTrend", None) or getattr(printing, "priceEur", None),
+                current_at=getattr(printing, "pricesUpdatedAt", None),
+                now=now,
+            )
+        result.append({
             "id": printing.id,
-            "catalogId": getattr(printing, "catalogId", None),
-            "setCode": set_code,
+            "catalogId": catalog_id,
+            "setCode": code,
             "collectorNumber": getattr(printing, "collectorNumber", ""),
             "rarity": getattr(printing, "rarity", None),
             "imageUri": getattr(printing, "imageUri", None),
@@ -142,9 +428,47 @@ async def set_cards(set_code: str):
             "priceCardmarketTrend": getattr(printing, "priceCardmarketTrend", None),
             "priceCardmarketMin": getattr(printing, "priceCardmarketMin", None),
             "priceCardmarketMax": getattr(printing, "priceCardmarketMax", None),
-        }
-        for printing in printings
-    ]
+            "priceTrendAbsoluteChange": trend_by_printing[printing.id][0],
+            "priceTrendPercentageChange": trend_by_printing[printing.id][1],
+            "cardName": name,
+            "typeLine": getattr(catalog, "typeLine", None),
+            "manaCost": getattr(catalog, "manaCost", None),
+            "isOwned": owned_quantity > 0,
+            "ownedQuantity": owned_quantity,
+            "collectionCardId": collection_card_id,
+            "acquiredAt": acquired_at,
+            "acquisitionTrendAbsoluteChange": acquisition_trend[0],
+            "acquisitionTrendPercentageChange": acquisition_trend[1],
+        })
+    return result
+
+
+@router.patch("/sets/{set_code}/acquisition-dates")
+async def set_missing_acquisition_dates(
+    set_code: str,
+    data: CollectionAcquisitionDateUpdate,
+    user_id: str = Depends(get_current_user_id),
+):
+    acquired_at = datetime.combine(data.acquiredAt, datetime_time.min, tzinfo=timezone.utc)
+    count = await db.execute_raw("""
+        UPDATE user_collections c
+        SET acquired_at = $3::timestamp
+        WHERE c.user_id = $1 AND c.acquired_at IS NULL
+          AND (
+            lower(c.set_code) = lower($2)
+            OR lower(c.card_scryfall_id) IN (
+              SELECT lower(p.id) FROM card_printings p JOIN card_sets s ON s.id = p.set_id WHERE lower(s.code) = lower($2)
+              UNION SELECT lower(p.catalog_id) FROM card_printings p JOIN card_sets s ON s.id = p.set_id
+                    WHERE lower(s.code) = lower($2) AND p.catalog_id IS NOT NULL
+            )
+            OR lower(regexp_replace(btrim(split_part(c.card_name, '/', 1)), '[[:space:]]+', ' ', 'g')) IN (
+              SELECT lower(regexp_replace(btrim(split_part(cc.name, '/', 1)), '[[:space:]]+', ' ', 'g'))
+              FROM card_printings p JOIN card_sets s ON s.id = p.set_id
+              JOIN card_catalog cc ON cc.id = p.catalog_id WHERE lower(s.code) = lower($2)
+            )
+          )
+    """, user_id, set_code.lower(), acquired_at)
+    return {"updatedCount": int(count or 0)}
 
 
 @router.get("/printings/{printing_id}/prices", response_model=list[PriceHistoryPoint])

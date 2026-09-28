@@ -169,6 +169,7 @@ async def import_text(db, user_id, raw_text, request_key=None):
                 set_code text,collector_number text,mana_cost text,type_line text,image_uri text,enrichment_key text)
                 ON CONFLICT(user_id,card_scryfall_id,is_foil) DO UPDATE SET
                 quantity=user_collections.quantity+EXCLUDED.quantity,updated_at=NOW(),
+                acquired_at=COALESCE(user_collections.acquired_at,NOW()),
                 enrichment_key=EXCLUDED.enrichment_key''',json.dumps(values[start:start+BATCH_SIZE]))
         for start in range(0,len(ordered),BATCH_SIZE):
             await tx.execute_raw('''INSERT INTO collection_import_items(import_id,job_key)

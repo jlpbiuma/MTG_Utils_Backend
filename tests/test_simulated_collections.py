@@ -121,6 +121,7 @@ async def test_simulated_collection_analysis_metrics():
     """
 
     mock_db = MagicMock()
+    mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.deck.find_many = AsyncMock(return_value=[deck_1, deck_2])
     mock_db.collectioncard.find_many = AsyncMock(return_value=[real_col_card])
     mock_db.cardprinting.find_many = AsyncMock(return_value=[p_sol_zero, p_sol_cheapest, p_signet, p_forest])
@@ -206,6 +207,7 @@ async def test_simulated_collection_persistence_and_deletion():
     created_coll.userId = "user-123"
 
     mock_db = MagicMock()
+    mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.deck.find_many = AsyncMock(return_value=[deck])
     mock_db.collectioncard.find_many = AsyncMock(return_value=[])
     mock_db.cardprinting.find_many = AsyncMock(return_value=[])
@@ -268,6 +270,7 @@ async def test_cardprinting_without_manacost_attribute_does_not_raise_attribute_
     printing = StrictCardPrinting("bolt-id", 0.75, catalog)
 
     mock_db = MagicMock()
+    mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.deck.find_many = AsyncMock(return_value=[])
     mock_db.collectioncard.find_many = AsyncMock(return_value=[])
     mock_db.cardprinting.find_many = AsyncMock(return_value=[printing])
@@ -319,6 +322,7 @@ async def test_simulated_collection_spanish_basics_and_owned_exclusion():
     owned_sol.quantity = 1
 
     mock_db = MagicMock()
+    mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.deck.find_many = AsyncMock(return_value=[deck])
     mock_db.collectioncard.find_many = AsyncMock(return_value=[owned_sol])
     mock_db.cardprinting.find_many = AsyncMock(return_value=[])

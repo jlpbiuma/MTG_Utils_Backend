@@ -1,6 +1,6 @@
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, date
 from src.schemas.deck import DeckRequirement
 from src.schemas.pricing import PriceSummary
 
@@ -14,6 +14,7 @@ class CollectionCardCreate(BaseModel):
     manaCost: Optional[str] = None
     typeLine: Optional[str] = None
     imageUri: Optional[str] = None
+    acquiredAt: Optional[datetime] = None
 
 class CollectionCardUpdate(BaseModel):
     quantity: int = Field(..., ge=0)
@@ -25,6 +26,10 @@ class CollectionCardUpdateVersion(BaseModel):
     imageUri: Optional[str] = None
     setCode: Optional[str] = None
     collectorNumber: Optional[str] = None
+
+
+class CollectionAcquisitionDateUpdate(BaseModel):
+    acquiredAt: date
 
 
 class CollectionCardResponse(BaseModel):
@@ -40,6 +45,7 @@ class CollectionCardResponse(BaseModel):
     typeLine: Optional[str] = None
     imageUri: Optional[str] = None
     updatedAt: datetime
+    acquiredAt: Optional[datetime] = None
     requestedInDecks: List[DeckRequirement] = []
     requestedInDecksCount: int = 0
 

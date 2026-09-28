@@ -1,6 +1,7 @@
 import logging
 import functools
 import asyncio
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from src.core.db import db
 from src.schemas.collection import (
@@ -124,6 +125,7 @@ class CollectionService:
                 typeLine=c.typeLine,
                 imageUri=local_images.get(c.cardScryfallId) or safe_image_uri(c.imageUri),
                 updatedAt=c.updatedAt,
+                acquiredAt=getattr(c, "acquiredAt", None),
             )
             for c in cards
         ]
@@ -181,6 +183,7 @@ class CollectionService:
                     typeLine=c.typeLine,
                     imageUri=local_images.get(c.cardScryfallId) or safe_image_uri(c.imageUri),
                     updatedAt=c.updatedAt,
+                    acquiredAt=getattr(c, "acquiredAt", None),
                     requestedInDecks=req_list,
                     requestedInDecksCount=len(req_list),
                 )
@@ -365,9 +368,14 @@ class CollectionService:
         )
 
         if existing:
+            update_data = {"quantity": {"increment": data.quantity}}
+            if data.acquiredAt is not None:
+                update_data["acquiredAt"] = data.acquiredAt
+            elif getattr(existing, "acquiredAt", None) is None:
+                update_data["acquiredAt"] = datetime.now(timezone.utc)
             updated = await db.collectioncard.update(
                 where={"id": existing.id},
-                data={"quantity": {"increment": data.quantity}}
+                data=update_data
             )
             c = updated
         else:
@@ -400,6 +408,7 @@ class CollectionService:
                     "imageUri": image_uri,
                     "setCode": set_code,
                     "collectorNumber": collector_num,
+                    "acquiredAt": data.acquiredAt or datetime.now(timezone.utc),
                 }
             )
             c = created
@@ -423,6 +432,7 @@ class CollectionService:
             typeLine=c.typeLine,
             imageUri=safe_image_uri(c.imageUri),
             updatedAt=c.updatedAt,
+            acquiredAt=getattr(c, "acquiredAt", None),
         )
 
     @staticmethod
@@ -443,6 +453,8 @@ class CollectionService:
             return None
 
         update_data: Dict[str, Any] = {"quantity": quantity}
+        if quantity > card.quantity and getattr(card, "acquiredAt", None) is None:
+            update_data["acquiredAt"] = datetime.now(timezone.utc)
         if set_code_provided:
             update_data["setCode"] = set_code or None
         updated = await db.collectioncard.update(
@@ -462,6 +474,21 @@ class CollectionService:
             typeLine=updated.typeLine,
             imageUri=safe_image_uri(updated.imageUri),
             updatedAt=updated.updatedAt,
+            acquiredAt=getattr(updated, "acquiredAt", None),
+        )
+
+    @staticmethod
+    async def update_acquired_at(user_id: str, card_id: str, acquired_at: datetime) -> Optional[CollectionCardResponse]:
+        card = await db.collectioncard.find_unique(where={"id": card_id})
+        if not card or card.userId != user_id:
+            return None
+        updated = await db.collectioncard.update(where={"id": card_id}, data={"acquiredAt": acquired_at})
+        return CollectionCardResponse(
+            id=updated.id, userId=updated.userId, cardScryfallId=updated.cardScryfallId,
+            cardName=updated.cardName, quantity=updated.quantity, isFoil=getattr(updated, "isFoil", False),
+            setCode=updated.setCode, collectorNumber=updated.collectorNumber, manaCost=updated.manaCost,
+            typeLine=updated.typeLine, imageUri=safe_image_uri(updated.imageUri), updatedAt=updated.updatedAt,
+            acquiredAt=getattr(updated, "acquiredAt", None),
         )
 
     @staticmethod
@@ -505,6 +532,7 @@ class CollectionService:
                 typeLine=updated.typeLine,
                 imageUri=safe_image_uri(updated.imageUri),
                 updatedAt=updated.updatedAt,
+                acquiredAt=getattr(updated, "acquiredAt", None),
             )
 
         conflict = await db.collectioncard.find_first(
@@ -526,6 +554,11 @@ class CollectionService:
                         collector_number
                         if collector_number is not None
                         else conflict.collectorNumber
+                    ),
+                    "acquiredAt": (
+                        getattr(conflict, "acquiredAt", None)
+                        or getattr(card, "acquiredAt", None)
+                        or datetime.now(timezone.utc)
                     ),
                 },
             )
@@ -553,6 +586,7 @@ class CollectionService:
             typeLine=updated.typeLine,
             imageUri=safe_image_uri(updated.imageUri),
             updatedAt=updated.updatedAt,
+            acquiredAt=getattr(updated, "acquiredAt", None),
         )
 
     @staticmethod
@@ -693,4 +727,3 @@ class CollectionService:
             activeCommanders=active_commanders,
             cards=dormant_items,
         )
-

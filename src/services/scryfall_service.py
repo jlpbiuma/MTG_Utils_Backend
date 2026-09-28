@@ -223,7 +223,7 @@ class ScryfallService:
         return results
 
     @staticmethod
-    async def search_cards(query: str, page: int = 1) -> Dict[str, Any]:
+    async def search_cards(query: str, page: int = 1, *, prefer_local: bool = False) -> Dict[str, Any]:
         if not query or not query.strip():
             return {"total_cards": 0, "has_more": False, "data": []}
 
@@ -234,7 +234,10 @@ class ScryfallService:
 
         top_score = score_card_match(local_results[0].get("name"), query) if local_results else 99
         # Return local directly if we have a top exact/word match
-        if local_results and top_score <= 1:
+        # Interactive name searches can show partial local matches immediately.
+        # Keep the default API behavior and Scryfall syntax searches unchanged.
+        plain_name = not re.search(r'[:!"()<>=]|\b(?:OR|AND|NOT)\b', query)
+        if local_results and (top_score <= 1 or (prefer_local and plain_name and page == 1)):
             return {
                 "total_cards": len(local_results),
                 "has_more": False,

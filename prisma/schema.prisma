@@ -63,6 +63,7 @@ model CollectionCard {
   manaCost        String?  @map("mana_cost")
   typeLine        String?  @map("type_line")
   imageUri        String?  @map("image_uri")
+  acquiredAt      DateTime? @default(now()) @map("acquired_at")
   updatedAt       DateTime @default(now()) @updatedAt @map("updated_at")
 
   @@unique([userId, cardScryfallId, isFoil], name: "userId_cardScryfallId")
@@ -344,6 +345,7 @@ model SimulatedCollection {
   userId      String          @map("user_id")
   name        String
   description String?
+  rawText     String?         @map("raw_text") @db.Text
   createdAt   DateTime        @default(now()) @map("created_at")
   updatedAt   DateTime        @default(now()) @updatedAt @map("updated_at")
   cards       SimulatedCard[]
@@ -356,6 +358,7 @@ model SimulatedCard {
   id                    String              @id @default(uuid())
   simulatedCollectionId String              @map("simulated_collection_id")
   cardScryfallId        String?             @map("card_scryfall_id")
+  selectedPrintingId   String?             @map("selected_printing_id")
   cardName              String              @map("card_name")
   quantity              Int                 @default(1)
   setCode               String?             @map("set_code")
@@ -364,6 +367,7 @@ model SimulatedCard {
   typeLine              String?             @map("type_line")
   imageUri              String?             @map("image_uri")
   price                 Float?              @map("price")
+  acquiredAt            DateTime?            @default(now()) @map("acquired_at")
   simulatedCollection   SimulatedCollection @relation(fields: [simulatedCollectionId], references: [id], onDelete: Cascade)
 
   @@index([simulatedCollectionId])
@@ -455,5 +459,4 @@ model EdhrecCommander {
   @@index([syncedAt])
   @@map("edhrec_commanders")
 }
-
 

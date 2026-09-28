@@ -1,4 +1,5 @@
 import pytest
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from types import SimpleNamespace
 from src.schemas.collection import CollectionCardCreate
@@ -8,6 +9,7 @@ def test_collection_create_schema():
     c = CollectionCardCreate(cardScryfallId="scry-1", cardName="Sol Ring", quantity=2)
     assert c.cardName == "Sol Ring"
     assert c.quantity == 2
+    assert c.acquiredAt is None
 
 @pytest.mark.asyncio
 async def test_get_collection_stats():
@@ -92,3 +94,41 @@ async def test_get_user_collection_pagination_parameters():
         skip=18,
     )
 
+
+@pytest.mark.asyncio
+async def test_new_collection_card_saves_acquisition_checkpoint():
+    now = datetime.now(timezone.utc)
+    created = SimpleNamespace(
+        id="new-card", userId="user-1", cardScryfallId="printing-1", cardName="Sol Ring",
+        quantity=2, setCode="c21", collectorNumber="263", manaCost=None, typeLine=None,
+        imageUri=None, updatedAt=now, acquiredAt=now,
+    )
+    mock_db = MagicMock()
+    mock_db.collectioncard.find_unique = AsyncMock(return_value=None)
+    mock_db.collectioncard.create = AsyncMock(return_value=created)
+    with patch("src.services.collection_service.db", mock_db), patch(
+        "src.services.collection_service.ScryfallService.get_catalog_card", new=AsyncMock(return_value=None)
+    ), patch("src.services.collection_service.trigger_async_priority_enrichment"):
+        response = await CollectionService.add_or_increment_card(
+            "user-1", CollectionCardCreate(cardScryfallId="printing-1", cardName="Sol Ring", quantity=2)
+        )
+    create_data = mock_db.collectioncard.create.call_args.kwargs["data"]
+    assert isinstance(create_data["acquiredAt"], datetime)
+    assert response.acquiredAt == now
+
+
+@pytest.mark.asyncio
+async def test_manual_acquisition_checkpoint_update_is_user_scoped():
+    acquired_at = datetime(2025, 1, 2, tzinfo=timezone.utc)
+    card = SimpleNamespace(
+        id="card-1", userId="user-1", cardScryfallId="printing-1", cardName="Sol Ring",
+        quantity=1, setCode="c21", collectorNumber="263", manaCost=None, typeLine=None,
+        imageUri=None, updatedAt=acquired_at, acquiredAt=acquired_at,
+    )
+    mock_db = MagicMock()
+    mock_db.collectioncard.find_unique = AsyncMock(return_value=card)
+    mock_db.collectioncard.update = AsyncMock(return_value=card)
+    with patch("src.services.collection_service.db", mock_db):
+        response = await CollectionService.update_acquired_at("user-1", "card-1", acquired_at)
+    assert response.acquiredAt == acquired_at
+    mock_db.collectioncard.update.assert_awaited_once_with(where={"id": "card-1"}, data={"acquiredAt": acquired_at})

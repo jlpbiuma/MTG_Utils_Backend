@@ -8,8 +8,12 @@ from src.services.image_resolver import safe_image_uri, strip_scryfall_image_uri
 router = APIRouter(prefix="/scryfall", tags=["scryfall"])
 
 @router.get("/search")
-async def search_cards(q: str = Query(..., min_length=1), page: int = Query(1, ge=1)):
-    return await ScryfallService.search_cards(q, page)
+async def search_cards(
+    q: str = Query(..., min_length=1),
+    page: int = Query(1, ge=1),
+    prefer_local: bool = Query(False),
+):
+    return await ScryfallService.search_cards(q, page, prefer_local=prefer_local)
 
 @router.get("/autocomplete")
 async def autocomplete_cards(q: str = Query(..., min_length=2)):
