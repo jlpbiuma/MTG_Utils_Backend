@@ -83,6 +83,7 @@ class DeckRequirement(BaseModel):
     quantity: int
     completionPercentage: float = 0.0
     colors: List[str] = []
+    isSideboard: bool = False
 
 class DeckCardWithOwnership(BaseModel):
     id: str

@@ -206,9 +206,11 @@ class EdhrecService:
                     deckId=d_id,
                     deckName=d_name,
                     quantity=qty,
+                    isSideboard=bool(getattr(oc, "isSideboard", False)),
                 )
             else:
                 decks_by_norm[norm][d_id].quantity += qty
+                decks_by_norm[norm][d_id].isSideboard |= bool(getattr(oc, "isSideboard", False))
 
         completion = completion_percentages_by_deck(user_deck_cards, col_map)
         colors = colors_by_deck(user_deck_cards)
@@ -540,4 +542,3 @@ class EdhrecService:
             totalPages=total_pages,
             commanders=paged_items,
         )
-

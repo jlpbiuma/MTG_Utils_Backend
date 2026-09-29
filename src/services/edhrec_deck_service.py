@@ -184,7 +184,8 @@ async def get_recommended_deck(slug: str, user_id: str):
         by_deck = requests.setdefault(norm, {})
         if card.deckId not in by_deck:
             by_deck[card.deckId] = DeckRequirement(deckId=card.deckId, deckName=deck_name,
-                quantity=0, completionPercentage=completion.get(card.deckId, 0), colors=colors.get(card.deckId, []))
+                quantity=0, completionPercentage=completion.get(card.deckId, 0), colors=colors.get(card.deckId, []),
+                isSideboard=card.isSideboard)
         by_deck[card.deckId].quantity += card.quantity
         if card.assignedQuantity > 0:
             assigned = assignments.setdefault(norm, {})

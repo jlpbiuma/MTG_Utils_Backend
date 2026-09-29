@@ -619,6 +619,7 @@ async def test_get_deck_detail_reports_requested_in_decks():
         cardName="Arcane Signet",
         quantity=1,
         assignedQuantity=0,
+        isSideboard=True,
         deck=deck_urza
     )
 
@@ -655,6 +656,8 @@ async def test_get_deck_detail_reports_requested_in_decks():
     assert "Mazo Tidus" in deck_names
     assert "Urza Lord High" in deck_names
     assert "Atraxa Proliferate" in deck_names
+    urza_requirement = next(req for req in signet.requestedInDecks if req.deckId == "deck-urza")
+    assert urza_requirement.isSideboard is True
 
     # Current deck comes first
     assert signet.requestedInDecks[0].deckId == "deck-tidus"
@@ -756,5 +759,4 @@ async def test_add_missing_cards_to_collection_bulk():
     assert mock_db.deckcard.update.call_count == 2
     mock_db.deckcard.update.assert_any_call(where={"id": "c1"}, data={"assignedQuantity": 1})
     mock_db.deckcard.update.assert_any_call(where={"id": "c2"}, data={"assignedQuantity": 2})
-
 

@@ -108,6 +108,8 @@ class CardPrintingResponse(BaseModel):
     manaCost: Optional[str] = None
     isOwned: bool = False
     ownedQuantity: int = 0
+    ownedElsewhere: bool = False
+    otherPrintings: List[dict] = []
     collectionCardId: Optional[str] = None
     acquiredAt: Optional[datetime] = None
     acquisitionTrendAbsoluteChange: Optional[float] = None
@@ -124,6 +126,7 @@ class CardSetResponse(BaseModel):
     completionPercentage: int = 0
     totalValueEur: float = 0.0
     ownedValueEur: float = 0.0
+    missingValueEur: float = 0.0
 
 
 class ExpansionValueHistoryPoint(BaseModel):

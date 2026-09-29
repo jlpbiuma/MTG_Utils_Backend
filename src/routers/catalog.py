@@ -125,7 +125,7 @@ def clear_price_history_cache():
 async def list_sets(limit: int = Query(2000, ge=1, le=2000), user_id: str = Depends(get_current_user_id)):
     sets = await db.cardset.find_many(take=limit, order={"releasedAt": "desc"})
     rows = await db.collectioncard.find_many(where={"userId": user_id, "setCode": {"not": None}})
-    value_by_set: dict[str, tuple[float, float]] = {}
+    value_by_set: dict[str, tuple[float, float, float]] = {}
     counts_by_set: dict[str, tuple[int, int]] = {}
     if hasattr(db, "query_raw"):
         try:
@@ -134,7 +134,9 @@ async def list_sets(limit: int = Query(2000, ge=1, le=2000), user_id: str = Depe
                        COUNT(DISTINCT p.id)::int AS "cardCount",
                        COUNT(DISTINCT p.id) FILTER (WHERE COALESCE(owned.quantity, 0) > 0)::int AS "ownedCount",
                        COALESCE(SUM(COALESCE(p.price_cardmarket_trend, p.price_eur, 0)), 0)::float AS "totalValueEur",
-                       COALESCE(SUM(COALESCE(p.price_cardmarket_trend, p.price_eur, 0) * COALESCE(owned.quantity, 0)), 0)::float AS "ownedValueEur"
+                       COALESCE(SUM(COALESCE(p.price_cardmarket_trend, p.price_eur, 0) * COALESCE(owned.quantity, 0)), 0)::float AS "ownedValueEur",
+                       COALESCE(SUM(CASE WHEN COALESCE(owned.quantity, 0) = 0
+                           THEN COALESCE(p.price_cardmarket_trend, p.price_eur, 0) ELSE 0 END), 0)::float AS "missingValueEur"
                 FROM card_sets s
                 LEFT JOIN card_printings p ON p.set_id = s.id
                 LEFT JOIN LATERAL (
@@ -143,15 +145,16 @@ async def list_sets(limit: int = Query(2000, ge=1, le=2000), user_id: str = Depe
                     WHERE c.user_id = $1 AND (
                         (lower(c.set_code) = lower(s.code) AND lower(c.collector_number) = lower(p.collector_number))
                         OR lower(c.card_scryfall_id) = lower(p.id)
-                        OR (p.catalog_id IS NOT NULL AND lower(c.card_scryfall_id) = lower(p.catalog_id))
-                        OR lower(regexp_replace(btrim(split_part(c.card_name, '/', 1)), '[[:space:]]+', ' ', 'g')) =
-                           lower(regexp_replace(btrim(split_part((SELECT name FROM card_catalog WHERE id = p.catalog_id), '/', 1)), '[[:space:]]+', ' ', 'g'))
                     )
                 ) owned ON true
                 GROUP BY s.code
             """, user_id)
             value_by_set = {
-                str(row["code"]).lower(): (float(row.get("totalValueEur") or 0), float(row.get("ownedValueEur") or 0))
+                str(row["code"]).lower(): (
+                    float(row.get("totalValueEur") or 0),
+                    float(row.get("ownedValueEur") or 0),
+                    float(row.get("missingValueEur") or 0),
+                )
                 for row in (value_rows or [])
             }
             counts_by_set = {
@@ -174,7 +177,7 @@ async def list_sets(limit: int = Query(2000, ge=1, le=2000), user_id: str = Depe
             code.lower(),
             (max(getattr(card_set, "cardCount", 0) or 0, 0), fallback_owned),
         )
-        total_value, owned_value = value_by_set.get(code.lower(), (0.0, 0.0))
+        total_value, owned_value, missing_value = value_by_set.get(code.lower(), (0.0, 0.0, 0.0))
         result.append({
             "code": code,
             "name": getattr(card_set, "name", "") or code.upper(),
@@ -186,6 +189,7 @@ async def list_sets(limit: int = Query(2000, ge=1, le=2000), user_id: str = Depe
             "completionPercentage": round(min(owned, count) * 100 / count) if count else 0,
             "totalValueEur": round(total_value, 2),
             "ownedValueEur": round(owned_value, 2),
+            "missingValueEur": round(missing_value, 2),
         })
     return result
 
@@ -224,10 +228,6 @@ async def set_value_history(
     for printing in printings:
         catalog = getattr(printing, "catalog", None)
         keys = [f"id:{printing.id.casefold()}"]
-        if getattr(printing, "catalogId", None):
-            keys.append(f"id:{printing.catalogId.casefold()}")
-        if getattr(catalog, "name", None):
-            keys.append(f"name:{normalize_card_name(catalog.name)}")
         keys.append(f"printing:{code}:{(getattr(printing, 'collectorNumber', '') or '').casefold()}")
         quantities[printing.id] = max((owned_by_identity.get(key, 0) for key in keys), default=0)
 
@@ -301,30 +301,27 @@ async def set_cards(set_code: str, user_id: str = Depends(get_current_user_id)):
         order={"collectorNumber": "asc"},
         include={"catalog": True},
     )
-    # Collection records can point at a different printing (or omit set data
-    # after import). Treat any owned printing of the same catalog card as owned.
+    # Completion and owned value are tied to the exact printing in this set.
+    # Other owned versions are returned separately as informational matches.
     owned_rows = await db.collectioncard.find_many(where={"userId": user_id})
-    owned_by_identity: dict[str, int] = {}
     rows_by_identity: dict[str, list[Any]] = defaultdict(list)
     for row in owned_rows:
         card_name = getattr(row, "cardName", None)
         card_id = getattr(row, "cardScryfallId", None)
         owned_set = getattr(row, "setCode", None)
         owned_number = getattr(row, "collectorNumber", None)
-        quantity = getattr(row, "quantity", 0) or 0
         if card_name:
             key = f"name:{normalize_card_name(card_name)}"
-            owned_by_identity[key] = owned_by_identity.get(key, 0) + quantity
             rows_by_identity[key].append(row)
         if card_id:
             key = f"id:{card_id.casefold()}"
-            owned_by_identity[key] = owned_by_identity.get(key, 0) + quantity
             rows_by_identity[key].append(row)
         if owned_set and owned_number:
             key = f"printing:{owned_set.casefold()}:{owned_number.casefold()}"
-            owned_by_identity[key] = owned_by_identity.get(key, 0) + quantity
             rows_by_identity[key].append(row)
     acquisition_by_printing: dict[str, tuple[Optional[str], Optional[datetime]]] = {}
+    exact_rows_by_printing: dict[str, list[Any]] = {}
+    other_rows_by_printing: dict[str, list[Any]] = {}
     for printing in printings:
         catalog = getattr(printing, "catalog", None)
         identities = [
@@ -344,9 +341,24 @@ async def set_cards(set_code: str, user_id: str = Depends(get_current_user_id)):
         ordered_candidates = sorted(
             candidates.values(), key=lambda item: (item[0], -(getattr(item[1], "quantity", 0) or 0))
         )
-        acquired_row = next((row for _, row in ordered_candidates if getattr(row, "acquiredAt", None)), None)
+        collector_number = (getattr(printing, "collectorNumber", "") or "").casefold()
+        exact_rows = [
+            row for _, row in ordered_candidates
+            if (getattr(row, "cardScryfallId", None) or "").casefold() == printing.id.casefold()
+            or (
+                (getattr(row, "setCode", None) or "").casefold() == code
+                and (getattr(row, "collectorNumber", None) or "").casefold() == collector_number
+            )
+        ]
+        exact_rows_by_printing[printing.id] = exact_rows
+        exact_ids = {getattr(row, "id", str(id(row))) for row in exact_rows}
+        other_rows_by_printing[printing.id] = [
+            row for _, row in ordered_candidates
+            if getattr(row, "id", str(id(row))) not in exact_ids
+        ]
+        acquired_row = next((row for row in exact_rows if getattr(row, "acquiredAt", None)), None)
         if acquired_row is None and ordered_candidates:
-            acquired_row = ordered_candidates[0][1]
+            acquired_row = exact_rows[0] if exact_rows else None
         acquisition_by_printing[printing.id] = (
             getattr(acquired_row, "id", None), getattr(acquired_row, "acquiredAt", None)
         )
@@ -399,14 +411,17 @@ async def set_cards(set_code: str, user_id: str = Depends(get_current_user_id)):
         catalog = getattr(printing, "catalog", None)
         catalog_id = getattr(printing, "catalogId", None)
         name = getattr(catalog, "name", None)
-        identities = []
-        if name:
-            identities.append(f"name:{normalize_card_name(name)}")
-        if catalog_id:
-            identities.append(f"id:{catalog_id.casefold()}")
-        identities.append(f"id:{printing.id.casefold()}")
-        identities.append(f"printing:{code}:{(getattr(printing, 'collectorNumber', '') or '').casefold()}")
-        owned_quantity = max((owned_by_identity.get(key, 0) for key in identities), default=0)
+        exact_rows = exact_rows_by_printing.get(printing.id, [])
+        owned_quantity = sum(getattr(row, "quantity", 0) or 0 for row in exact_rows)
+        other_printing_quantities: dict[tuple[str, str], int] = defaultdict(int)
+        for row in other_rows_by_printing.get(printing.id, []):
+            other_code = (getattr(row, "setCode", None) or "").upper()
+            other_number = getattr(row, "collectorNumber", None) or "?"
+            other_printing_quantities[(other_code, other_number)] += getattr(row, "quantity", 0) or 0
+        other_printings = [
+            {"setCode": other_code, "collectorNumber": other_number, "quantity": quantity}
+            for (other_code, other_number), quantity in sorted(other_printing_quantities.items())
+        ]
         collection_card_id, acquired_at = acquisition_by_printing.get(printing.id, (None, None))
         acquisition_trend = (None, None)
         if acquired_at is not None:
@@ -435,8 +450,10 @@ async def set_cards(set_code: str, user_id: str = Depends(get_current_user_id)):
             "manaCost": getattr(catalog, "manaCost", None),
             "isOwned": owned_quantity > 0,
             "ownedQuantity": owned_quantity,
-            "collectionCardId": collection_card_id,
+            "collectionCardId": collection_card_id if owned_quantity else None,
             "acquiredAt": acquired_at,
+            "ownedElsewhere": bool(other_printings),
+            "otherPrintings": other_printings,
             "acquisitionTrendAbsoluteChange": acquisition_trend[0],
             "acquisitionTrendPercentageChange": acquisition_trend[1],
         })

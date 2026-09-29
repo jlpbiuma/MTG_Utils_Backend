@@ -77,9 +77,11 @@ class CollectionService:
                     quantity=qty,
                     completionPercentage=completion.get(d_id, 0.0),
                     colors=colors.get(d_id, []),
+                    isSideboard=bool(getattr(oc, "isSideboard", False)),
                 )
             else:
                 decks_by_norm[norm][d_id].quantity += qty
+                decks_by_norm[norm][d_id].isSideboard |= bool(getattr(oc, "isSideboard", False))
         return decks_by_norm
 
     @staticmethod

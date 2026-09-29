@@ -303,9 +303,11 @@ class DeckService:
                     deckId=deck.id,
                     deckName=deck.name,
                     quantity=c.quantity,
+                    isSideboard=c.isSideboard,
                 )
             else:
                 decks_by_norm[norm][deck.id].quantity += c.quantity
+                decks_by_norm[norm][deck.id].isSideboard |= c.isSideboard
 
         # Fetch other cards of this user to detect cross-deck assignments and multi-deck demand
         user_deck_cards = await db.deckcard.find_many(
@@ -336,9 +338,11 @@ class DeckService:
                         deckId=oc.deckId,
                         deckName=d_name,
                         quantity=oc.quantity,
+                        isSideboard=oc.isSideboard,
                     )
                 else:
                     decks_by_norm[norm][oc.deckId].quantity += oc.quantity
+                    decks_by_norm[norm][oc.deckId].isSideboard |= oc.isSideboard
 
         completion = completion_percentages_by_deck(user_deck_cards, col_map)
         colors = colors_by_deck(user_deck_cards)
