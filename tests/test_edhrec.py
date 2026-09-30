@@ -29,6 +29,48 @@ def test_get_edhrec_card_image_url():
     assert get_edhrec_card_image_url("a") is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("commander_name", "commander_cards", "expected_lookup_name"),
+    [
+        (
+            "Terra, Magical Adept // Esper Terra",
+            [SimpleNamespace(cardName="Terra, Magical Adept // Esper Terra")],
+            "Terra, Magical Adept",
+        ),
+        (
+            "Kraum, Ludevic's Opus // Tymna the Weaver",
+            [SimpleNamespace(cardName="Kraum, Ludevic's Opus"), SimpleNamespace(cardName="Tymna the Weaver")],
+            "Kraum, Ludevic's Opus // Tymna the Weaver",
+        ),
+    ],
+)
+async def test_recommendations_use_only_front_face_for_single_double_faced_commander(
+    commander_name, commander_cards, expected_lookup_name
+):
+    deck = SimpleNamespace(
+        id="deck-1",
+        userId="user-1",
+        commander=commander_name,
+    )
+    fake_db = SimpleNamespace(
+        deck=SimpleNamespace(find_unique=AsyncMock(return_value=deck)),
+        deckcard=SimpleNamespace(
+            find_many=AsyncMock(return_value=commander_cards),
+        ),
+    )
+    fetch_recommendations = AsyncMock(return_value=None)
+
+    with (
+        patch("src.services.edhrec_service.db", new=fake_db),
+        patch.object(EdhrecService, "fetch_edhrec_data", new=fetch_recommendations),
+    ):
+        result = await EdhrecService.get_deck_recommendations("deck-1", "user-1")
+
+    fetch_recommendations.assert_awaited_once_with(expected_lookup_name)
+    assert result.error == f"No se encontraron recomendaciones en EDHREC para {expected_lookup_name}"
+
+
 def _edhrec_commander_payload():
     """Shape returned by json.edhrec.com/pages/commanders/<slug>.json"""
     return {

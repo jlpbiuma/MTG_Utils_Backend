@@ -159,6 +159,17 @@ class EdhrecService:
         if not commander_name:
             return DeckRecommendationsResponse(error="El mazo no tiene comandante asignado")
 
+        # A single double-faced commander is stored with both face names joined
+        # by `//`, while partner commanders have two commander rows. EDHREC
+        # indexes the first case by its front-face name only; preserve the full
+        # name for actual partner pairs.
+        if "//" in commander_name:
+            commander_cards = await db.deckcard.find_many(
+                where={"deckId": deck_id, "isCommander": True}
+            )
+            if len(commander_cards or []) < 2:
+                commander_name = commander_name.split("//", 1)[0].strip()
+
         edhrec_data = await EdhrecService.fetch_edhrec_data(commander_name)
         if not edhrec_data:
             return DeckRecommendationsResponse(error=f"No se encontraron recomendaciones en EDHREC para {commander_name}")
