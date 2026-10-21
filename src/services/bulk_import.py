@@ -204,18 +204,23 @@ async def import_text(db, user_id, raw_text, request_key=None):
                         'quantityResolved': resolved_qty,
                     })
 
-    return {
-        'status': 'success',
-        'importId': import_id,
-        'importedCount': sum(i.quantity for i in items),
-        'uniqueCards': len(values),
-        'resolvedWants': resolved_wants,
-        'resolvedWantsCount': len(resolved_wants),
-    }
+        result = {
+            'status': 'success',
+            'importId': import_id,
+            'importedCount': sum(i.quantity for i in items),
+            'uniqueCards': len(values),
+            'resolvedWants': resolved_wants,
+            'resolvedWantsCount': len(resolved_wants),
+        }
+        await tx.execute_raw('UPDATE collection_imports SET replay_result=$2::jsonb WHERE id=$1',import_id,json.dumps(result))
+    return result
+
 
 
 
 def response(row):
+    if row.get('replay_result'):
+        return json.loads(row['replay_result']) if isinstance(row['replay_result'],str) else row['replay_result']
     return {'status':'success','importId':row['id'],'importedCount':row['imported_count'],'uniqueCards':row['unique_cards']}
 
 

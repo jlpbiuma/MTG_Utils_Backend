@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS collection_imports (
  imported_count integer NOT NULL,unique_cards integer NOT NULL,created_at timestamp(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE UNIQUE INDEX IF NOT EXISTS collection_imports_user_id_request_key_key ON collection_imports(user_id,request_key);
+ALTER TABLE collection_imports ADD COLUMN IF NOT EXISTS replay_result JSONB;
 CREATE TABLE IF NOT EXISTS collection_import_items (import_id text NOT NULL,job_key text NOT NULL,PRIMARY KEY(import_id,job_key));
 CREATE TABLE IF NOT EXISTS enrichment_jobs (
  key text PRIMARY KEY,identifier jsonb NOT NULL,status text NOT NULL DEFAULT 'queued',phase text NOT NULL DEFAULT 'resolve',card jsonb,

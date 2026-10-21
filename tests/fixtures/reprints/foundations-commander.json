@@ -1,0 +1,8 @@
+{
+  "source": "https://www.magic.wizards.com/en/news/announcements/foundations-commander-decklists",
+  "set": { "code": "fdc", "name": "Foundations Commander", "released_at": "2026-10-02", "set_type": "commander" },
+  "cards": [
+    { "name": "Taurean Mauler", "name_es": "Lacerador taurino", "old_release": "2008-02-01" },
+    { "name": "Hulking Raptor", "name_es": "Ráptor imponente", "old_release": "2023-11-17" }
+  ]
+}

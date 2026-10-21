@@ -16,7 +16,7 @@ from src.services.card_utils import (
     get_card_category,
     CARD_TYPE_GROUPS,
     extract_cmc,
-    completion_percentages_by_deck,
+    completion_percentages_by_deck, completion_cards, completion_owned,
     colors_by_deck,
 )
 from src.services.scryfall_service import ScryfallService
@@ -71,7 +71,7 @@ class WantService:
     @staticmethod
     async def _deck_demand_by_name(user_id: str) -> Dict[str, Dict[str, DeckRequirement]]:
         user_deck_cards = await db.deckcard.find_many(
-            where={"deck": {"userId": user_id}},
+            where={"deck": {"userId": user_id, "isArchived": False}, "isSideboard": False},
             include={"deck": True},
         )
         col_cards = await db.collectioncard.find_many(where={"userId": user_id})
@@ -83,6 +83,8 @@ class WantService:
         colors = colors_by_deck(user_deck_cards)
         decks_by_norm: Dict[str, Dict[str, DeckRequirement]] = {}
         for oc in user_deck_cards or []:
+            if getattr(oc, "isSideboard", False) or getattr(getattr(oc, "deck", None), "isArchived", False):
+                continue
             norm = normalize_card_name(oc.cardName)
             deck_obj = getattr(oc, "deck", None)
             d_id = getattr(oc, "deckId", None)
@@ -463,19 +465,21 @@ class WantService:
             return {"status": "error", "message": "Mazo no encontrado", "addedCount": 0}
 
         col_cards = await db.collectioncard.find_many(where={"userId": user_id})
-        col_map = {normalize_card_name(c.cardName): c.quantity for c in col_cards}
+        col_map = {}
+        for card in col_cards:
+            norm = normalize_card_name(card.cardName)
+            col_map[norm] = col_map.get(norm, 0) + card.quantity
 
         added_count = 0
         added_cards: List[str] = []
 
-        for card in (deck.cards or []):
+        for card in completion_cards(deck.cards or []):
             if is_basic_land(card.typeLine, card.cardName):
                 continue
             norm = normalize_card_name(card.cardName)
             owned_in_col = col_map.get(norm, 0)
             assigned = card.assignedQuantity or 0
-            actual_owned = min(card.quantity, max(assigned, min(owned_in_col, card.quantity)))
-            missing = max(0, card.quantity - actual_owned)
+            missing = int(not completion_owned(card, col_map))
 
             if missing > 0:
                 existing = await db.wantcard.find_unique(

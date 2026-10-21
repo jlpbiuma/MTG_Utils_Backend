@@ -1,0 +1,8 @@
+[
+  {"name":"Sol Ring","name_es":"Anillo solar","type_line":"Artifact","set_code":"cmm","collector_number":"1","printing_id":"ring","price":2.0},
+  {"name":"Arcane Signet","name_es":"Sello arcano","type_line":"Artifact","set_code":"cmm","collector_number":"2","printing_id":"signet","price":1.0},
+  {"name":"Lightning Bolt","name_es":"Relámpago","type_line":"Instant","set_code":"m10","collector_number":"3","printing_id":"bolt","price":0.5},
+  {"name":"Swords to Plowshares","name_es":"Espadas en guadañas","type_line":"Instant","set_code":"cmm","collector_number":"4","printing_id":"swords","price":1.5},
+  {"name":"Fire // Ice","name_es":"Fuego // Hielo","type_line":"Instant // Instant","set_code":"mh2","collector_number":"5","printing_id":"fire-ice","price":0.25},
+  {"name":"Forest","name_es":"Bosque","type_line":"Basic Land — Forest","set_code":"cmm","collector_number":"6","printing_id":"forest","price":0.1}
+]

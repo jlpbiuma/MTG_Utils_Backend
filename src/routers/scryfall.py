@@ -1,5 +1,8 @@
+from datetime import datetime
 from fastapi import APIRouter, Query
 from typing import List, Dict, Any, Optional
+from src.services.upcoming_reprints import upcoming_reprints_by_name
+from src.services.set_release_dates import corrected_set_release
 from src.services.scryfall_service import ScryfallService
 from src.services.card_utils import normalize_card_name, is_arena_or_digital_set_code
 from src.core.db import db
@@ -43,9 +46,10 @@ async def get_card_details(
         collector_number=collector_number,
     )
     if card:
-        catalog_id = card.get("id")
+        resolved_catalog_id = card.pop("_catalog_id", None)
+        catalog_id = resolved_catalog_id or card.get("id")
         try:
-            catalog = await db.cardcatalog.find_unique(
+            catalog = None if resolved_catalog_id else await db.cardcatalog.find_unique(
                 where={"normalizedName": normalize_card_name(card.get("name", ""))}
             )
             if catalog:
@@ -76,19 +80,22 @@ async def get_card_details(
             )
         except Exception:
             printings, rulings = [], []
+        reprints = await upcoming_reprints_by_name([card.get("name", "")], printings, db)
+        card["upcomingReprints"] = reprints.get(normalize_card_name(card.get("name", "")), [])
         card_name_es = card.get("name_es") or card.get("name") or ""
         card["printings"] = []
         for item in printings:
             set_obj = getattr(item, "set", None)
             set_name = getattr(set_obj, "name", None) if set_obj else None
             set_code = getattr(set_obj, "code", None) if set_obj else getattr(item, "setCode", None)
+            set_released = corrected_set_release(set_code, getattr(set_obj, "releasedAt", None))
             if getattr(set_obj, "isDigital", False):
                 continue
-            if getattr(set_obj, "setType", None) == "alchemy":
+            if getattr(set_obj, "setType", None) in ("alchemy", "art_series", "memorabilia"):
                 continue
             if item.collectorNumber and (item.collectorNumber.startswith("A-") or item.collectorNumber.startswith("a-")):
                 continue
-            if is_arena_or_digital_set_code(set_code):
+            if (set_code and len(set_code) == 4 and set_code.lower().startswith("a")) or is_arena_or_digital_set_code(set_code):
                 continue
             card["printings"].append(
                 {
@@ -114,6 +121,7 @@ async def get_card_details(
                     "price_usd": item.priceUsd,
                     "price_usd_foil": item.priceUsdFoil,
                     "released_at": item.releasedAt.isoformat() if item.releasedAt else None,
+                    "set_released_at": set_released.isoformat() if isinstance(set_released, datetime) else None,
                 }
             )
         local_printing = next(

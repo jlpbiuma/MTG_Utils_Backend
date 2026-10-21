@@ -88,7 +88,8 @@ async def test_batch_pricing_reduces_query_count():
 
     assert summary.totalCards == 30
     assert summary.ownedCards == 15
-    assert summary.missingCards == 15
+    assert summary.missingCards == 0
+    assert summary.completionPercentage == 100
     assert summary.totalValue == expected_total_value
     assert summary.ownedValue == expected_owned_value
     assert summary.missingValue == expected_missing_value

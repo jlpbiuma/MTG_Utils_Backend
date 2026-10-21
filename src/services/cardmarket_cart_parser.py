@@ -30,6 +30,7 @@ PRICE = re.compile(r"(?<![\w.,-])(\d+(?:[. ]\d{3})*,\d{2}|\d+\.\d{2}|\d+)\s*€"
 
 def parse_cardmarket_cart(raw_text: str) -> Optional[CartImport]:
     text = html.unescape(raw_text).replace("\\#", "#").replace("\u00a0", " ").replace("\u202f", " ")
+    text = re.sub(r"\\[ \t]*(?=\n|$)", "", text)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
     # Markdown tables become the same stream of fields as a browser clipboard.
     text = text.replace("|", "\n")

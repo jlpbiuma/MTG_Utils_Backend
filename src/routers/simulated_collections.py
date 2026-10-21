@@ -23,6 +23,7 @@ async def analyze_raw_collection(
         user_id=user_id,
         raw_text=payload.rawText,
         name="Análisis Temporal",
+        include_history=payload.includeHistory,
         provider=payload.provider,
         printing_overrides=payload.printingOverrides,
     )
@@ -43,6 +44,7 @@ async def create_simulated_collection(
         raw_text=payload.rawText,
         provider=provider,
         printing_overrides=payload.printingOverrides,
+        origin=payload.origin,
     )
 
 @router.get("", response_model=List[SimulatedCollectionSummary])

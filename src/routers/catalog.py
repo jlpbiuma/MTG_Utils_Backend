@@ -22,7 +22,10 @@ from src.schemas.pricing import (
 from src.schemas.collection import CollectionAcquisitionDateUpdate
 from src.services.pricing_service import PRICE_PROVIDERS
 from src.services.price_trends import calculate_price_trend, calculate_price_change_since
+from src.services.set_release_dates import corrected_set_release
 from src.services.card_utils import normalize_card_name
+from src.services.price_statistics import get_history_statistics
+from src.services.expansion_completion import is_base_printing, base_printing_sql, BASE_CHECKLIST_LIMITS
 
 logger = logging.getLogger(__name__)
 
@@ -125,29 +128,73 @@ def clear_price_history_cache():
 async def list_sets(limit: int = Query(2000, ge=1, le=2000), user_id: str = Depends(get_current_user_id)):
     sets = await db.cardset.find_many(take=limit, order={"releasedAt": "desc"})
     rows = await db.collectioncard.find_many(where={"userId": user_id, "setCode": {"not": None}})
+    value_rows = []
     value_by_set: dict[str, tuple[float, float, float]] = {}
     counts_by_set: dict[str, tuple[int, int]] = {}
+    available_by_set: dict[str, bool] = {}
+    alternatives_by_set: dict[str, int] = {}
     if hasattr(db, "query_raw"):
         try:
-            value_rows = await db.query_raw("""
+            # Resolve exact IDs using their index, then only resolve unmatched rows
+            # by set/collector number. A correlated OR would scan the catalog for
+            # each inventory row; each row must contribute to exactly one printing.
+            base_condition = base_printing_sql()
+            value_rows = await db.query_raw(f"""
+                WITH scoped_owned AS (
+                    SELECT id, card_scryfall_id, set_code, collector_number, quantity, is_foil
+                    FROM user_collections WHERE user_id = $1
+                ), fallback_owned AS (
+                    SELECT DISTINCT ON (c.id)
+                        c.id, p.id AS printing_id, c.quantity, c.is_foil
+                    FROM scoped_owned c
+                    JOIN card_sets cs ON lower(cs.code)=lower(c.set_code)
+                    JOIN card_printings p ON p.set_id=cs.id
+                        AND lower(p.collector_number)=lower(c.collector_number)
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM card_printings exact WHERE exact.id=c.card_scryfall_id
+                    )
+                    ORDER BY c.id, (p.collector_number=c.collector_number) DESC, p.id
+                ), resolved_owned AS (
+                    SELECT printing_id, SUM(quantity)::int AS quantity,
+                        SUM(quantity) FILTER (WHERE NOT is_foil)::int AS normal_quantity,
+                        SUM(quantity) FILTER (WHERE is_foil)::int AS foil_quantity
+                    FROM (
+                        SELECT p.id AS printing_id, c.quantity, c.is_foil
+                        FROM scoped_owned c JOIN card_printings p ON p.id=c.card_scryfall_id
+                        UNION ALL
+                        SELECT printing_id, quantity, is_foil FROM fallback_owned
+                    ) matches
+                    GROUP BY printing_id
+                ), completion_groups AS (
+                    SELECT p.set_id, COALESCE('catalog:' || p.catalog_id, 'printing:' || p.id) AS identity,
+                        BOOL_OR({base_condition}) AS in_checklist,
+                        BOOL_OR(COALESCE(owned.quantity, 0) > 0) AS is_owned,
+                        COUNT(*)::int AS versions
+                    FROM card_printings p
+                    JOIN card_sets s ON s.id=p.set_id
+                    LEFT JOIN resolved_owned owned ON owned.printing_id=p.id
+                    GROUP BY p.set_id, COALESCE('catalog:' || p.catalog_id, 'printing:' || p.id)
+                ), completion_stats AS (
+                    SELECT set_id,
+                        COUNT(*) FILTER (WHERE in_checklist)::int AS total,
+                        COUNT(*) FILTER (WHERE in_checklist AND is_owned)::int AS owned,
+                        COALESCE(SUM(versions - 1) FILTER (WHERE in_checklist), 0)::int AS alternatives
+                    FROM completion_groups GROUP BY set_id
+                )
                 SELECT s.code,
-                       COUNT(DISTINCT p.id)::int AS "cardCount",
-                       COUNT(DISTINCT p.id) FILTER (WHERE COALESCE(owned.quantity, 0) > 0)::int AS "ownedCount",
-                       COALESCE(SUM(COALESCE(p.price_cardmarket_trend, p.price_eur, 0)), 0)::float AS "totalValueEur",
-                       COALESCE(SUM(COALESCE(p.price_cardmarket_trend, p.price_eur, 0) * COALESCE(owned.quantity, 0)), 0)::float AS "ownedValueEur",
-                       COALESCE(SUM(CASE WHEN COALESCE(owned.quantity, 0) = 0
+                       COALESCE(stats.total, 0)::int AS "cardCount",
+                       COALESCE(stats.alternatives, 0)::int AS "alternativeVersionCount",
+                       COUNT(p.id) FILTER(WHERE ({base_condition}) AND COALESCE(p.price_cardmarket_trend,p.price_eur,0)>0)::int AS "pricedCount",
+                       COALESCE(stats.owned, 0)::int AS "ownedCount",
+                       COALESCE(SUM(COALESCE(p.price_cardmarket_trend, p.price_eur, 0)) FILTER (WHERE {base_condition}), 0)::float AS "totalValueEur",
+                       COALESCE(SUM((COALESCE(p.price_cardmarket_trend, p.price_eur, 0) * COALESCE(owned.normal_quantity, 0) + COALESCE(p.price_eur_foil, 0) * COALESCE(owned.foil_quantity, 0))), 0)::float AS "ownedValueEur",
+                       COALESCE(SUM(CASE WHEN ({base_condition}) AND COALESCE(owned.quantity, 0) = 0
                            THEN COALESCE(p.price_cardmarket_trend, p.price_eur, 0) ELSE 0 END), 0)::float AS "missingValueEur"
                 FROM card_sets s
                 LEFT JOIN card_printings p ON p.set_id = s.id
-                LEFT JOIN LATERAL (
-                    SELECT SUM(c.quantity)::int AS quantity
-                    FROM user_collections c
-                    WHERE c.user_id = $1 AND (
-                        (lower(c.set_code) = lower(s.code) AND lower(c.collector_number) = lower(p.collector_number))
-                        OR lower(c.card_scryfall_id) = lower(p.id)
-                    )
-                ) owned ON true
-                GROUP BY s.code
+                LEFT JOIN resolved_owned owned ON owned.printing_id = p.id
+                LEFT JOIN completion_stats stats ON stats.set_id=s.id
+                GROUP BY s.code, stats.total, stats.owned, stats.alternatives
             """, user_id)
             value_by_set = {
                 str(row["code"]).lower(): (
@@ -157,17 +204,39 @@ async def list_sets(limit: int = Query(2000, ge=1, le=2000), user_id: str = Depe
                 )
                 for row in (value_rows or [])
             }
+            alternatives_by_set = {str(row["code"]).lower(): int(row.get("alternativeVersionCount") or 0) for row in (value_rows or [])}
+            available_by_set = {str(row["code"]).lower(): row.get("pricedCount", 1) > 0 for row in (value_rows or [])}
             counts_by_set = {
                 str(row["code"]).lower(): (int(row.get("cardCount") or 0), int(row.get("ownedCount") or 0))
                 for row in (value_rows or [])
             }
         except Exception:
             logger.exception("Unable to aggregate expansion values")
+    batch_stats = {}
+    try:
+        stats = await db.query_raw("""WITH lot_values AS (
+          SELECT b.id,codes.code AS set_code,b.currency,b.cost_total+b.shipping AS investment,
+            COALESCE(SUM(CASE WHEN (CASE WHEN i.is_foil THEN p.price_eur_foil ELSE COALESCE(p.price_cardmarket_trend,p.price_eur) END)>=0.25
+              THEN (CASE WHEN i.is_foil THEN p.price_eur_foil ELSE COALESCE(p.price_cardmarket_trend,p.price_eur) END)*i.quantity ELSE 0 END),0) AS value,
+            COUNT(i.id) AS assigned,
+            COUNT(i.id) FILTER(WHERE (CASE WHEN i.is_foil THEN p.price_eur_foil ELSE COALESCE(p.price_cardmarket_trend,p.price_eur) END) IS NULL) AS unpriced
+          FROM acquisition_batches b
+          CROSS JOIN LATERAL (SELECT lower(b.set_code) AS code WHERE b.set_code IS NOT NULL
+            UNION SELECT lower(s.code) FROM acquisition_batch_items bi JOIN card_printings bp ON bp.id=bi.printing_id
+              JOIN card_sets s ON s.id=bp.set_id WHERE bi.batch_id=b.id) codes
+          LEFT JOIN acquisition_batch_items i ON i.batch_id=b.id
+          LEFT JOIN card_printings p ON p.id=i.printing_id WHERE b.user_id=$1 GROUP BY b.id,codes.code)
+          SELECT set_code AS code,COUNT(*)::int AS n,
+            CASE WHEN SUM(investment)>0 AND bool_and(currency='EUR' AND assigned>0 AND unpriced=0)
+              THEN ((SUM(value)/SUM(investment)-1)*100)::float END AS roi FROM lot_values GROUP BY set_code""", user_id)
+        batch_stats = {row["code"].lower(): row for row in stats}
+    except Exception:
+        logger.warning("Acquisition batch stats unavailable; apply purchase pipeline migration")
     owned_by_set: dict[str, set[str]] = {}
     for row in rows:
         code = (getattr(row, "setCode", None) or "").lower()
         number = (getattr(row, "collectorNumber", None) or "").casefold()
-        if code and number:
+        if code and number and (getattr(row, "quantity", 0) or 0) > 0 and is_base_printing(code, number):
             owned_by_set.setdefault(code, set()).add(number)
     result = []
     for card_set in sets:
@@ -175,15 +244,19 @@ async def list_sets(limit: int = Query(2000, ge=1, le=2000), user_id: str = Depe
         fallback_owned = len(owned_by_set.get(code.lower(), set()))
         count, owned = counts_by_set.get(
             code.lower(),
-            (max(getattr(card_set, "cardCount", 0) or 0, 0), fallback_owned),
+            (BASE_CHECKLIST_LIMITS.get(code.lower(), max(getattr(card_set, "cardCount", 0) or 0, 0)), fallback_owned),
         )
         total_value, owned_value, missing_value = value_by_set.get(code.lower(), (0.0, 0.0, 0.0))
         result.append({
+            "valuesAvailable": available_by_set.get(code.lower(), False),
+            "batchCount": batch_stats.get(code.lower(), {}).get("n", 0),
+            "roi": batch_stats.get(code.lower(), {}).get("roi"),
             "code": code,
             "name": getattr(card_set, "name", "") or code.upper(),
             "setType": getattr(card_set, "setType", "unknown"),
             "cardCount": count,
-            "releasedAt": getattr(card_set, "releasedAt", None),
+            "alternativeVersionCount": alternatives_by_set.get(code.lower(), 0),
+            "releasedAt": corrected_set_release(code, getattr(card_set, "releasedAt", None)),
             "iconSvgUri": getattr(card_set, "iconSvgUri", None),
             "ownedCount": owned,
             "completionPercentage": round(min(owned, count) * 100 / count) if count else 0,
@@ -251,7 +324,7 @@ async def set_value_history(
         if latest is None:
             latest = getattr(printing, "priceEur", None)
         latest = float(latest or 0)
-        current_total += latest
+        current_total += latest if is_base_printing(code, printing.collectorNumber) else 0
         current_owned += latest * quantities.get(printing.id, 0)
     chart_days = [start_date + timedelta(days=offset) for offset in range(days + 1)]
     day_prices: dict[str, list[float]] = {}
@@ -279,7 +352,7 @@ async def set_value_history(
         total = owned = 0.0
         for printing in printings:
             historical_price = day_prices[printing.id][offset]
-            total += historical_price
+            total += historical_price if is_base_printing(code, printing.collectorNumber) else 0
             owned += historical_price * quantities.get(printing.id, 0)
         points.append({"date": day.isoformat(), "totalValue": round(total, 2), "ownedValue": round(owned, 2)})
     return {
@@ -301,8 +374,8 @@ async def set_cards(set_code: str, user_id: str = Depends(get_current_user_id)):
         order={"collectorNumber": "asc"},
         include={"catalog": True},
     )
-    # Completion and owned value are tied to the exact printing in this set.
-    # Other owned versions are returned separately as informational matches.
+    # Inventory and values stay tied to the exact printing. Completion groups
+    # catalog identities within this edition; other editions never cover it.
     owned_rows = await db.collectioncard.find_many(where={"userId": user_id})
     rows_by_identity: dict[str, list[Any]] = defaultdict(list)
     for row in owned_rows:
@@ -437,6 +510,7 @@ async def set_cards(set_code: str, user_id: str = Depends(get_current_user_id)):
             "catalogId": catalog_id,
             "setCode": code,
             "collectorNumber": getattr(printing, "collectorNumber", ""),
+            "isBasePrinting": is_base_printing(code, getattr(printing, "collectorNumber", "")),
             "rarity": getattr(printing, "rarity", None),
             "imageUri": getattr(printing, "imageUri", None),
             "priceEur": getattr(printing, "priceEur", None),
@@ -594,6 +668,8 @@ async def card_price_history(
                         recordedAt=h.recordedAt,
                     )
 
+    statistics, _ = await get_history_statistics(db, [(pid, foil, 1) for pid in printing_ids for foil in (False, True)])
+
     series: list[PrintingPriceSeries] = []
     card_printings_by_set: dict[str, Any] = {}
     for printing in printings:
@@ -609,6 +685,8 @@ async def card_price_history(
 
         series.append(
             PrintingPriceSeries(
+                statistics=statistics.get((printing.id, False)),
+                foilStatistics=statistics.get((printing.id, True)),
                 printingId=printing.id,
                 setCode=set_code,
                 collectorNumber=getattr(printing, "collectorNumber", ""),

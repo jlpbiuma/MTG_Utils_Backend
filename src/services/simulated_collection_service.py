@@ -1,15 +1,23 @@
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone
 import re
+import asyncio
 from src.services.cardmarket_cart_parser import parse_cardmarket_cart, CartImport
+from dataclasses import dataclass, replace
+from src.services.upcoming_reprints import upcoming_reprints_by_name
+from src.services.offer_name_resolver import resolve_offer_names
+from src.services.scryfall_service import fold_search_text
 from src.services.simulated_purchase_service import compare_purchase
+from src.services.price_statistics import enrich_purchase_history, get_history_statistics
+from src.schemas.price_statistics import PriceHistoryStatistics
+from src.schemas.whatsapp_deals import WhatsAppMatchesResponse, WhatsAppDealMatch, WantMatchInfo, CollectionMatchInfo
 from src.schemas.import_export import ParsedCardEntry
 from src.core.db import db
 from fastapi import HTTPException
 from src.services.card_utils import (
-    normalize_card_name,
+    normalize_card_name, completion_owned,
     is_basic_land,
-    completion_percentages_by_deck,
+    completion_percentages_by_deck, completion_cards, completion_counts,
     colors_by_deck,
 )
 from src.services.image_resolver import safe_image_uri
@@ -22,7 +30,45 @@ from src.schemas.simulated_collections import (
     SimulatedCollectionAnalysisResponse,
 )
 
+@dataclass
+class OfferAnalysisContext:
+    """User data reused within one request; never a shared or persistent cache."""
+    user_id: str
+    user_data: tuple
+    resolved_names: dict
+    printings: list
+    reprints: dict
+
+
 class SimulatedCollectionService:
+    @staticmethod
+    async def _prepare_context(user_id, names):
+        decks, collection, wants, resolved = await asyncio.gather(
+            db.deck.find_many(where={"userId": user_id, "isArchived": False}, include={"cards": True}),
+            db.collectioncard.find_many(where={"userId": user_id}),
+            db.wantcard.find_many(where={"userId": user_id}),
+            resolve_offer_names(names, db),
+        )
+        canonical = [resolved.get(fold_search_text(name), name) for name in names]
+        norms = sorted({normalize_card_name(name) for name in canonical})
+        printings = await db.cardprinting.find_many(
+            where={"catalog": {"normalizedName": {"in": norms}}},
+            include={"catalog": True, "set": True},
+        ) if norms else []
+        reprints = await upcoming_reprints_by_name(canonical, printings, db)
+        return OfferAnalysisContext(user_id, (decks, collection, wants), resolved, printings, reprints)
+
+    @staticmethod
+    def _saved_names(coll):
+        raw = getattr(coll, "rawText", None)
+        if isinstance(raw, str) and raw.strip():
+            cart = parse_cardmarket_cart(raw)
+            names = [entry.name for entry in (cart.entries if cart else parse_decklist_text(raw))]
+        else:
+            names = [card.cardName for card in (coll.cards or [])]
+        return names + [normalize_card_name(card.cardName) for card in (coll.cards or [])
+                        if isinstance(getattr(card, "selectedPrintingId", None), str) and card.selectedPrintingId]
+
     @staticmethod
     async def analyze_raw_text(
         user_id: str,
@@ -31,6 +77,8 @@ class SimulatedCollectionService:
         description: Optional[str] = None,
         provider: str = "cardmarket",
         printing_overrides: Optional[Dict[str, str]] = None,
+        include_history: bool = True,
+        context: Optional[OfferAnalysisContext] = None,
     ) -> SimulatedCollectionAnalysisResponse:
         cart = parse_cardmarket_cart(raw_text)
         if cart is not None:
@@ -82,8 +130,9 @@ class SimulatedCollectionService:
             provider=provider,
             collection_id=None,
             purchase_cart=cart,
+            include_history=include_history,
             raw_text=raw_text,
-            printing_overrides=printing_overrides,
+            printing_overrides=printing_overrides, context=context,
         )
 
     @staticmethod
@@ -97,24 +146,44 @@ class SimulatedCollectionService:
         purchase_cart: Optional[CartImport] = None,
         raw_text: Optional[str] = None,
         printing_overrides: Optional[Dict[str, str]] = None,
+        include_history: bool = True,
+        context: Optional[OfferAnalysisContext] = None,
     ) -> SimulatedCollectionAnalysisResponse:
+        # Translate exact local aliases before demand, inventory and pricing lookups.
+        if context is not None and context.user_id != user_id:
+            raise ValueError("Offer analysis context belongs to another user")
+        resolved_names = context.resolved_names if context is not None else await resolve_offer_names([card["cardName"] for card in cards_input] + list(printing_overrides or {}), db)
+        def canonical_name(value):
+            return resolved_names.get(fold_search_text(value), value)
+        canonical_cards = {}
+        for card in cards_input:
+            canonical = canonical_name(card["cardName"])
+            key = normalize_card_name(canonical)
+            if key not in canonical_cards:
+                canonical_cards[key] = {**card, "cardName": canonical, "quantity": 0, "sourceNames": []}
+            canonical_cards[key]["quantity"] += card["quantity"]
+            for source in card.get("sourceNames") or [card["cardName"]]:
+                if source not in canonical_cards[key]["sourceNames"]:
+                    canonical_cards[key]["sourceNames"].append(source)
+        cards_input = list(canonical_cards.values())
+        if purchase_cart is not None:
+            purchase_cart = replace(purchase_cart, entries=[replace(entry, name=canonical_name(entry.name)) for entry in purchase_cart.entries])
+        printing_overrides = {normalize_card_name(canonical_name(key)): value for key, value in (printing_overrides or {}).items()}
+
         prov_info = PRICE_PROVIDERS.get(provider, PRICE_PROVIDERS["cardmarket"])
         symbol = prov_info.get("symbol", "€")
 
-        # 1. Fetch user decks & deck cards
-        user_decks = await db.deck.find_many(
-            where={"userId": user_id, "isArchived": False},
-            include={"cards": True},
+        # These user-scoped reads are independent; dispatch them together.
+        user_decks, real_collection, wants = context.user_data if context is not None else await asyncio.gather(
+            db.deck.find_many(where={"userId": user_id, "isArchived": False}, include={"cards": True}),
+            db.collectioncard.find_many(where={"userId": user_id}),
+            db.wantcard.find_many(where={"userId": user_id}),
         )
-
-        # 2. Fetch real collection
-        real_collection = await db.collectioncard.find_many(where={"userId": user_id})
         col_map: Dict[str, int] = {}
         for c in real_collection:
             norm = normalize_card_name(c.cardName)
             col_map[norm] = col_map.get(norm, 0) + c.quantity
 
-        wants = await db.wantcard.find_many(where={"userId": user_id})
         want_names = {normalize_card_name(w.cardName) for w in wants}
 
         # 3. Calculate deck completion % and colors
@@ -122,14 +191,12 @@ class SimulatedCollectionService:
         completions = completion_percentages_by_deck(all_deck_cards, col_map)
         deck_colors = colors_by_deck(all_deck_cards)
 
-        deck_non_basics_count: Dict[str, int] = {}
+        deck_completion_totals: Dict[str, int] = {}
         deck_cards_by_norm: Dict[str, List[Dict[str, Any]]] = {}
 
         for d in user_decks:
-            nb_count = 0
-            for c in (d.cards or []):
-                if not is_basic_land(c.typeLine, c.cardName):
-                    nb_count += c.quantity
+            total_count, owned_count = completion_counts(d.cards or [], col_map)
+            for c in completion_cards(d.cards or []):
                 norm = normalize_card_name(c.cardName)
                 if norm not in deck_cards_by_norm:
                     deck_cards_by_norm[norm] = []
@@ -137,6 +204,7 @@ class SimulatedCollectionService:
                     "deckId": d.id,
                     "deckName": d.name,
                     "completionPercentage": completions.get(d.id, 0.0),
+                    "ownedCards": owned_count,
                     "colors": deck_colors.get(d.id, []),
                     "requestedQuantity": c.quantity,
                     "assignedQuantity": c.assignedQuantity or 0,
@@ -145,9 +213,9 @@ class SimulatedCollectionService:
                     "imageUri": c.imageUri,
                     "cardScryfallId": c.cardScryfallId,
                 })
-            deck_non_basics_count[d.id] = nb_count
+            deck_completion_totals[d.id] = total_count
 
-        total_non_basics_all_decks = sum(deck_non_basics_count.values())
+        total_completion_cards = sum(deck_completion_totals.values())
 
         # 4. Resolve cheapest positive printings for cards in the simulation
         sim_norms = [normalize_card_name(c["cardName"]) for c in cards_input]
@@ -156,10 +224,11 @@ class SimulatedCollectionService:
 
         all_printings = []
         if sim_norms:
-            all_printings = await db.cardprinting.find_many(
+            all_printings = [p for p in context.printings if p.catalog.normalizedName in sim_norms] if context is not None else await db.cardprinting.find_many(
                 where={"catalog": {"normalizedName": {"in": sim_norms}}},
                 include={"catalog": True, "set": True},
             )
+            all_printings = [p for p in all_printings if getattr(getattr(p, "set", None), "setType", None) not in ("art_series", "memorabilia") and not (isinstance(getattr(getattr(p, "set", None), "code", None), str) and len(p.set.code) == 4 and p.set.code.lower().startswith("a"))]
             for p in all_printings:
                 cat = getattr(p, "catalog", None)
                 norm = getattr(cat, "normalizedName", None) if cat else None
@@ -181,6 +250,8 @@ class SimulatedCollectionService:
                         "printing": p,
                         "price": p_price,
                     }
+
+        upcoming_reprints = context.reprints if context is not None else await upcoming_reprints_by_name([card["cardName"] for card in cards_input], all_printings, db)
 
         overrides = {normalize_card_name(name): value for name, value in (printing_overrides or {}).items()}
         selected_printings = {}
@@ -231,9 +302,16 @@ class SimulatedCollectionService:
             scryfall_id = None
             set_code = c.get("setCode")
             collector_number = c.get("collectorNumber")
+            selected_printing = None
 
-            if norm in selected_printings:
-                p = selected_printings[norm]
+            exact_source = next((p for p in all_printings
+                if normalize_card_name(getattr(p.catalog, "normalizedName", "")) == norm
+                and c.get("setCode") and c.get("collectorNumber")
+                and (getattr(getattr(p, "set", None), "code", "") or "").lower() == c["setCode"].lower()
+                and str(getattr(p, "collectorNumber", "")) == str(c["collectorNumber"])), None)
+            if norm in selected_printings or exact_source:
+                p = selected_printings.get(norm) or exact_source
+                selected_printing = p
                 unit_price = max(0.0, float(p.priceCardmarketTrend or p.priceEur or 0.0))
                 meta = _extract_printing_meta(p)
                 scryfall_id = meta["scryfall_id"]
@@ -244,6 +322,7 @@ class SimulatedCollectionService:
                 collector_number = meta["collector_number"]
             elif best_info:
                 p = best_info["printing"]
+                selected_printing = p
                 unit_price = best_info["price"]
                 meta = _extract_printing_meta(p)
                 scryfall_id = meta["scryfall_id"]
@@ -256,6 +335,7 @@ class SimulatedCollectionService:
                     collector_number = meta["collector_number"]
             elif norm in fallback_printings:
                 p = fallback_printings[norm]
+                selected_printing = p
                 meta = _extract_printing_meta(p)
                 scryfall_id = meta["scryfall_id"]
                 mana_cost = meta["mana_cost"]
@@ -297,11 +377,12 @@ class SimulatedCollectionService:
                 for d in deck_matches:
                     req = d["requestedQuantity"]
                     asgn = d["assignedQuantity"]
-                    missing = max(0, req - asgn)
+                    missing = int(asgn <= 0)
                     if missing > 0:
                         total_missing += missing
-                        deck_nb = deck_non_basics_count.get(d["deckId"], 1)
-                        pot_gain = round((min(quantity, missing) / deck_nb) * 100, 1) if deck_nb > 0 else 0.0
+                        deck_nb = deck_completion_totals.get(d["deckId"], 1)
+                        owned_count = d["ownedCards"]
+                        pot_gain = round((owned_count + 1) / deck_nb * 100, 1) - d["completionPercentage"] if deck_nb > 0 else 0.0
                         candidate_decks.append(
                             CandidateDeckInfo(
                                 deckId=d["deckId"],
@@ -312,15 +393,17 @@ class SimulatedCollectionService:
                                 assignedQuantity=asgn,
                                 missingQuantity=missing,
                                 potentialGain=pot_gain,
+                                totalCards=deck_nb,
+                                ownedCards=owned_count,
                             )
                         )
                         benefited_deck_ids.add(d["deckId"])
 
-                useful_copies = min(quantity, total_missing)
+                useful_copies = min(quantity, 1) if total_missing else 0
                 surplus_copies = max(0, quantity - useful_copies)
 
-                if total_non_basics_all_decks > 0 and useful_copies > 0:
-                    net_gain = round((useful_copies / total_non_basics_all_decks) * 100, 2)
+                if total_completion_cards > 0 and useful_copies > 0:
+                    net_gain = round(sum(cd.potentialGain for cd in candidate_decks) / len(user_decks), 2) if user_decks else 0
 
             # Sanitize strings to avoid non-string types
             def _to_str(val):
@@ -339,9 +422,11 @@ class SimulatedCollectionService:
 
             analysis_cards.append(
                 SimulatedCardAnalysisItem(
-                    selectedPrintingId=overrides.get(norm),
+                    upcomingReprints=upcoming_reprints.get(norm, []),
+                    selectedPrintingId=getattr(selected_printing, "id", None),
                     inWants=norm in want_names,
                     cardName=card_name,
+                    sourceNames=c.get("sourceNames", []),
                     cardScryfallId=scryfall_id_str,
                     quantity=quantity,
                     setCode=set_code_str,
@@ -375,18 +460,88 @@ class SimulatedCollectionService:
         already_owned_cards_count = sum(c.quantity for c in analysis_cards if c.copiesOwnedReal > 0)
         total_cards_count = sum(c.quantity for c in analysis_cards)
         global_net_gain = (
-            round((total_useful_copies / total_non_basics_all_decks) * 100, 2)
-            if total_non_basics_all_decks > 0
+            round(sum(sum(cd.potentialGain for cd in card.candidateDecks) for card in analysis_cards) / len(user_decks), 2)
+            if user_decks
             else 0.0
         )
 
         purchase = None
         if purchase_cart is not None:
             purchase = compare_purchase(purchase_cart, all_printings, wants, col_map, set(deck_cards_by_norm), overrides)
+            if include_history:
+                await enrich_purchase_history(db, purchase)
+            history_statistics = purchase.historyStatistics
+            history_covered = purchase.historyCoveredCopies
+            history_missing = purchase.missingHistoryCopies
+        elif include_history:
+            statistics, history_statistics = await get_history_statistics(db,
+                [(card.cardScryfallId, False, card.quantity) for card in analysis_cards], include_total=True)
+            for card in analysis_cards:
+                card.historyStatistics = statistics.get((card.cardScryfallId, False), PriceHistoryStatistics())
+            history_covered = sum(card.quantity for card in analysis_cards if card.historyStatistics.observations)
+            history_missing = sum(card.quantity for card in analysis_cards if not card.historyStatistics.observations)
+            if history_missing:
+                history_statistics = PriceHistoryStatistics()
+
+        if not include_history:
+            history_statistics = None
+            history_covered = history_missing = 0
+
+        from src.services.opportunity_completion import enrich_completion
+        matches = []
+        wants_by_name = {}
+        for want in wants:
+            norm = normalize_card_name(want.cardName)
+            wants_by_name.setdefault(norm, []).append(want)
+        for index, card in enumerate(analysis_cards):
+            norm = normalize_card_name(card.cardName)
+            requested = wants_by_name.get(norm, [])
+            if not card.candidateDecks and not requested:
+                continue
+            capacity = sum(want.quantity for want in requested) if requested else 1
+            matches.append(WhatsAppDealMatch(
+                id=index + 1, card_name=card.cardName, normalized_name=norm,
+                subject="vende", whatsapp_url=f"offer:{collection_id or 'temporary'}", source_phone="", direct_whatsapp_link="",
+                set_code=card.setCode, extra={"source": "manual", "quantity": card.quantity},
+                unit_price=card.unitPrice if card.unitPrice > 0 else None,
+                trend_unit_price=card.unitPrice if card.unitPrice > 0 else None,
+                price_source="cardmarket" if card.unitPrice > 0 else None,
+                trade_quantity=min(card.quantity, capacity),
+                matched_want=WantMatchInfo(want_id=getattr(requested[0], "id", "") if requested else "", quantity_wanted=capacity,
+                                          requested_decks=[deck.deckName for deck in card.candidateDecks]),
+            ))
+        deck_count, before = enrich_completion(matches, user_decks, all_deck_cards, real_collection)
+        projected = dict(col_map)
+        for card in analysis_cards:
+            if card.quantity > 0:
+                projected[normalize_card_name(card.cardName)] = max(1, projected.get(normalize_card_name(card.cardName), 0))
+        after_by_deck = completion_percentages_by_deck(all_deck_cards, projected)
+        after = sum(after_by_deck.get(deck.id, 0) for deck in user_decks) / deck_count if deck_count else 0
+        global_net_gain = round(max(0, after - before), 2)
+        match_by_name = {match.normalized_name: match for match in matches}
+        for card in analysis_cards:
+            match = match_by_name.get(normalize_card_name(card.cardName))
+            card.netCompletionGain = match.completion_gain if match else 0
+        if purchase:
+            purchase_by_name = {}
+            for row in purchase.cards:
+                purchase_by_name.setdefault(normalize_card_name(row.cardName), []).append(row)
+            for match in matches:
+                entries = purchase_by_name.get(match.normalized_name, [])
+                if entries and all(row.purchaseUnitPrice is not None for row in entries):
+                    copies = sum(row.quantity for row in entries)
+                    match.unit_price = sum(row.purchaseUnitPrice * row.quantity for row in entries) / copies
+                    match.price = str(match.unit_price)
+                    match.price_source = "link"
+        opportunities = WhatsAppMatchesResponse(wants_matches=matches, total_wants_matches=len(matches),
+            total_cards_scanned=len(analysis_cards), global_deck_count=deck_count, global_completion_before=before)
 
         return SimulatedCollectionAnalysisResponse(
             printingOverrides=overrides,
             rawText=raw_text,
+            historyStatistics=history_statistics,
+            historyCoveredCopies=history_covered,
+            missingHistoryCopies=history_missing,
             purchaseAnalysis=purchase,
             id=collection_id,
             name=name,
@@ -397,6 +552,9 @@ class SimulatedCollectionService:
             sellableCardsCount=total_sellable_cards,
             currencySymbol=symbol,
             globalNetGain=global_net_gain,
+            opportunityMatches=opportunities,
+            globalCompletionBefore=before,
+            globalCompletionAfter=after,
             totalCards=total_cards_count,
             uniqueCards=len(analysis_cards),
             usefulCardsCount=total_useful_copies,
@@ -415,6 +573,7 @@ class SimulatedCollectionService:
         raw_text: str,
         provider: str = "cardmarket",
         printing_overrides: Optional[Dict[str, str]] = None,
+        origin: str = "other",
     ) -> SimulatedCollectionAnalysisResponse:
         # Run live analysis first
         analysis = await SimulatedCollectionService.analyze_raw_text(
@@ -424,6 +583,7 @@ class SimulatedCollectionService:
             description=description,
             provider=provider,
             printing_overrides=printing_overrides,
+            include_history=origin == "cardmarket",
         )
 
         # Save to database
@@ -433,6 +593,7 @@ class SimulatedCollectionService:
                 "name": name,
                 "description": description,
                 "rawText": raw_text,
+                "origin": origin,
             }
         )
 
@@ -443,7 +604,7 @@ class SimulatedCollectionService:
                 data={
                     "simulatedCollectionId": saved_coll.id,
                     "cardScryfallId": c.cardScryfallId,
-                    "selectedPrintingId": analysis.printingOverrides.get(normalize_card_name(c.cardName)),
+                    "selectedPrintingId": c.selectedPrintingId,
                     "cardName": c.cardName,
                     "quantity": c.quantity,
                     "setCode": c.setCode,
@@ -458,10 +619,15 @@ class SimulatedCollectionService:
             c.acquiredAt = checkpoint
 
         analysis.id = saved_coll.id
+        analysis.origin = origin
+        from src.services.acquisition_finance import valuation_revision
+        analysis.valuationRevision = valuation_revision(analysis)
         return analysis
 
     @staticmethod
-    async def _analyze_saved(user_id: str, coll: Any, provider: str, override: Optional[Dict[str, str]] = None) -> SimulatedCollectionAnalysisResponse:
+    async def _analyze_saved(user_id: str, coll: Any, provider: str, override: Optional[Dict[str, str]] = None, include_history: Optional[bool] = None, context: Optional[OfferAnalysisContext] = None) -> SimulatedCollectionAnalysisResponse:
+        if include_history is None:
+            include_history = getattr(coll, "origin", "other") == "cardmarket"
         overrides = {normalize_card_name(c.cardName): c.selectedPrintingId for c in (coll.cards or [])
                      if isinstance(getattr(c, "selectedPrintingId", None), str) and c.selectedPrintingId}
         overrides.update(override or {})
@@ -469,9 +635,14 @@ class SimulatedCollectionService:
         if isinstance(raw_text, str) and raw_text.strip():
             analysis = await SimulatedCollectionService.analyze_raw_text(
                 user_id, raw_text, coll.name, coll.description, provider, overrides,
+                include_history=include_history, context=context,
             )
             analysis.id = coll.id
+            SimulatedCollectionService._attach_offer(analysis, coll)
             SimulatedCollectionService._attach_acquisition_dates(analysis, coll.cards or [])
+            await SimulatedCollectionService._attach_opportunities(user_id, analysis, coll, context=context)
+            from src.services.acquisition_finance import valuation_revision
+            analysis.valuationRevision = valuation_revision(analysis)
             return analysis
         analysis = await SimulatedCollectionService._run_analysis(
             user_id=user_id,
@@ -479,10 +650,102 @@ class SimulatedCollectionService:
                           "setCode": c.setCode, "collectorNumber": c.collectorNumber}
                          for c in (coll.cards or [])],
             name=coll.name, description=coll.description, provider=provider, collection_id=coll.id,
-            printing_overrides=overrides,
+            include_history=include_history,
+            printing_overrides=overrides, context=context,
         )
         SimulatedCollectionService._attach_acquisition_dates(analysis, coll.cards or [])
+        SimulatedCollectionService._attach_offer(analysis, coll)
+        await SimulatedCollectionService._attach_opportunities(user_id, analysis, coll, context=context)
+        from src.services.acquisition_finance import valuation_revision
+        analysis.valuationRevision = valuation_revision(analysis)
         return analysis
+
+    @staticmethod
+    async def _attach_opportunities(user_id, analysis, coll, context=None):
+        import json
+        from src.services.opportunity_valuation import _amount
+        metadata = getattr(coll, "sourceMetadata", None)
+        original = metadata.get("rows", []) if isinstance(metadata, dict) else []
+        aliases = {normalize_card_name(source): normalize_card_name(card.cardName) for card in analysis.cards for source in card.sourceNames}
+        by_name = {aliases.get(normalize_card_name(row["card_name"]), normalize_card_name(row["card_name"])): row for row in original}
+        opportunities = analysis.opportunityMatches
+        if opportunities is None:
+            return
+        if analysis.opportunitySubject == "compra_busca":
+            # Allocation remains physical: completion sharing never creates free sale copies.
+            collection = context.user_data[1] if context is not None else await db.collectioncard.find_many(where={"userId": user_id})
+            assignments = [card for deck in context.user_data[0] for card in (deck.cards or [])] if context is not None else await db.deckcard.find_many(where={"deck": {"userId": user_id, "isArchived": False}})
+            owned, assigned = {}, {}
+            for card in collection:
+                norm = normalize_card_name(card.cardName)
+                owned[norm] = owned.get(norm, 0) + card.quantity
+            for card in assignments:
+                norm = normalize_card_name(card.cardName)
+                assigned[norm] = assigned.get(norm, 0) + (card.assignedQuantity or 0)
+            sale = []
+            for index, card in enumerate(analysis.cards):
+                norm = normalize_card_name(card.cardName)
+                free = max(0, owned.get(norm, 0) - assigned.get(norm, 0))
+                if free:
+                    sale.append(WhatsAppDealMatch(id=index + 1, card_name=card.cardName, normalized_name=norm,
+                        subject="compra_busca", whatsapp_url="", source_phone="", direct_whatsapp_link="",
+                        set_code=card.setCode, extra={"source": "manual", "quantity": card.quantity},
+                        unit_price=card.unitPrice if card.unitPrice > 0 else None,
+                        trend_unit_price=card.unitPrice if card.unitPrice > 0 else None,
+                        price_source="cardmarket" if card.unitPrice > 0 else None,
+                        trade_quantity=min(card.quantity, free),
+                        matched_collection=CollectionMatchInfo(collection_id="", quantity_owned=owned[norm], available_quantity=free)))
+            analysis.globalNetGain = 0
+            analysis.globalCompletionAfter = analysis.globalCompletionBefore
+            analysis.usefulCardsCount = analysis.benefitedDecksCount = 0
+            for card in analysis.cards:
+                norm = normalize_card_name(card.cardName)
+                card.candidateDecks = []
+                card.candidateDeckCount = 0
+                card.netCompletionGain = 0
+                card.usefulCopies = 0
+                card.sellableCopies = min(card.quantity, max(0, owned.get(norm, 0) - assigned.get(norm, 0)))
+                card.sellableValue = round(card.sellableCopies * card.unitPrice, 2)
+            analysis.sellableCardsCount = sum(card.sellableCopies for card in analysis.cards)
+            analysis.sellableValue = round(sum(card.sellableValue for card in analysis.cards), 2)
+            opportunities.wants_matches = []
+            opportunities.collection_matches = sale
+            opportunities.total_wants_matches = 0
+            opportunities.total_collection_matches = len(sale)
+        from src.services.whatsapp_deals_service import _format_whatsapp_link
+        for match in opportunities.wants_matches + opportunities.collection_matches:
+            source = by_name.get(match.normalized_name, {})
+            extra = json.loads(source.get("extra_json") or "{}")
+            match.whatsapp_url = analysis.sourceUrl or f"offer:{analysis.id}"
+            match.source_phone = source.get("source_phone") or ""
+            match.source_chat = source.get("source_chat")
+            match.raw_message = source.get("raw_message")
+            match.detected_at = source.get("detected_at")
+            match.condition = source.get("condition")
+            if match.source_phone:
+                match.direct_whatsapp_link = _format_whatsapp_link(match.source_phone, f"Hola, te escribo por tu lista de Magic: {match.card_name}.")
+            match.price = source.get("price") if source else match.price
+            amount = _amount(match.price)
+            if amount is None:
+                amount = _amount(extra.get("reference_price"))
+            if amount is not None:
+                match.unit_price = amount
+                match.price_source = "link"
+                match.price_currency = {"€": "EUR", "$": "USD"}.get(source.get("currency"), source.get("currency") or "EUR")
+            match.extra.update(extra)
+
+    @staticmethod
+    def _attach_offer(analysis, coll):
+        for key in ["origin", "opportunitySubject", "status", "seller", "shipping", "sourceUrl", "paidTotal", "confirmedBatchId"]:
+            value = getattr(coll, key, None)
+            if isinstance(value, (str, int, float)) or value is None:
+                if value is not None:
+                    setattr(analysis, key, value)
+            elif key in ("shipping", "paidTotal"):
+                try:
+                    setattr(analysis, key, float(value))
+                except (ValueError, TypeError):
+                    pass
 
     @staticmethod
     def _attach_acquisition_dates(analysis: SimulatedCollectionAnalysisResponse, cards: List[Any]) -> None:
@@ -504,11 +767,14 @@ class SimulatedCollectionService:
             order={"createdAt": "desc"},
         )
 
+        context = await SimulatedCollectionService._prepare_context(user_id, [name for coll in colls for name in SimulatedCollectionService._saved_names(coll)]) if colls else None
         summaries: List[SimulatedCollectionSummary] = []
         for coll in colls:
-            analysis = await SimulatedCollectionService._analyze_saved(user_id, coll, provider)
+            analysis = await SimulatedCollectionService._analyze_saved(user_id, coll, provider, include_history=False, context=context)
             summaries.append(
                 SimulatedCollectionSummary(
+                    origin=analysis.origin, opportunitySubject=analysis.opportunitySubject, globalCompletionBefore=analysis.globalCompletionBefore, globalCompletionAfter=analysis.globalCompletionAfter, opportunityMatches=analysis.opportunityMatches,
+                    status=analysis.status, seller=analysis.seller, shipping=analysis.shipping, sourceUrl=analysis.sourceUrl, paidTotal=analysis.paidTotal, confirmedBatchId=analysis.confirmedBatchId,
                     id=coll.id,
                     name=coll.name,
                     description=coll.description,
@@ -545,7 +811,10 @@ class SimulatedCollectionService:
         if not coll or coll.userId != user_id:
             return None
 
-        return await SimulatedCollectionService._analyze_saved(user_id, coll, provider)
+        analysis = await SimulatedCollectionService._analyze_saved(user_id, coll, provider)
+        from src.services.acquisition_finance import valuation_revision
+        analysis.valuationRevision = valuation_revision(analysis)
+        return analysis
 
     @staticmethod
     async def update_card_version(user_id: str, collection_id: str, card_name: str,
@@ -553,8 +822,19 @@ class SimulatedCollectionService:
         coll = await db.simulatedcollection.find_unique(where={"id": collection_id}, include={"cards": True})
         if not coll or coll.userId != user_id:
             raise HTTPException(status_code=404, detail="Colección simulada no encontrada.")
+        if getattr(coll, "status", None) == "purchased":
+            raise HTTPException(status_code=409, detail="La oferta ya está comprada; edita las cartas en tu inventario.")
         norm = normalize_card_name(card_name)
         matches = [c for c in (coll.cards or []) if normalize_card_name(c.cardName) == norm]
+        if not matches:
+            # Offers saved before bilingual resolution can still store Spanish names.
+            current = await SimulatedCollectionService._analyze_saved(user_id, coll, provider)
+            target = next((card for card in current.cards if normalize_card_name(card.cardName) == norm
+                           or any(fold_search_text(source) == fold_search_text(card_name) for source in card.sourceNames)), None)
+            if target:
+                source_names = {normalize_card_name(source) for source in target.sourceNames} | {normalize_card_name(target.cardName)}
+                matches = [card for card in (coll.cards or []) if normalize_card_name(card.cardName) in source_names]
+                norm = normalize_card_name(target.cardName)
         if not matches:
             raise HTTPException(status_code=404, detail="Carta no encontrada en la simulación.")
         # Recalculate and validate the printing before persisting the explicit choice.
@@ -563,6 +843,8 @@ class SimulatedCollectionService:
             where={"simulatedCollectionId": collection_id, "cardName": {"in": [c.cardName for c in matches]}},
             data={"selectedPrintingId": printing_id},
         )
+        from src.services.acquisition_finance import valuation_revision
+        analysis.valuationRevision = valuation_revision(analysis)
         return analysis
 
     @staticmethod
@@ -571,6 +853,8 @@ class SimulatedCollectionService:
         coll = await db.simulatedcollection.find_unique(where={"id": collection_id}, include={"cards": True})
         if not coll or coll.userId != user_id:
             raise HTTPException(status_code=404, detail="Colección simulada no encontrada.")
+        if getattr(coll, "status", None) == "purchased":
+            raise HTTPException(status_code=409, detail="La oferta ya está comprada; edita las cartas en tu inventario.")
         name = card_name.strip()
         if not name or "\n" in name or "\r" in name:
             raise HTTPException(status_code=422, detail="El nombre de la carta no es válido.")
@@ -586,6 +870,12 @@ class SimulatedCollectionService:
                 updated_text = f"{raw_text.rstrip()}\n// Mainboard\n{quantity} {name}\n"
         elif operation == "remove":
             target = normalize_card_name(name)
+            current = await SimulatedCollectionService._analyze_saved(user_id, coll, provider)
+            targets = {target}
+            for card in current.cards:
+                if normalize_card_name(card.cardName) == target or any(fold_search_text(source) == fold_search_text(name) for source in card.sourceNames):
+                    targets.add(normalize_card_name(card.cardName))
+                    targets.update(normalize_card_name(source) for source in card.sourceNames)
             if cart is not None:
                 markers = list(re.finditer(r"(?im)^\s*(\d+)x\b", raw_text))
                 if not markers:
@@ -597,7 +887,7 @@ class SimulatedCollectionService:
                     chunk = raw_text[marker.start():end]
                     parsed = parse_cardmarket_cart(chunk + "\n0,00 €")
                     entry_name = parsed.entries[0].name if parsed and parsed.entries else ""
-                    if normalize_card_name(entry_name) == target:
+                    if normalize_card_name(entry_name) in targets:
                         removed = True
                     else:
                         chunks.append(chunk)
@@ -609,7 +899,7 @@ class SimulatedCollectionService:
                 removed = False
                 for line in raw_text.splitlines(keepends=True):
                     parsed = parse_decklist_text(line)
-                    if any(normalize_card_name(entry.name) == target for entry in parsed):
+                    if any(normalize_card_name(entry.name) in targets for entry in parsed):
                         removed = True
                     else:
                         kept_lines.append(line)
@@ -631,7 +921,8 @@ class SimulatedCollectionService:
         checkpoint = datetime.now(timezone.utc)
         updated_cart = parse_cardmarket_cart(updated_text)
         updated_entries = updated_cart.entries if updated_cart is not None else parse_decklist_text(updated_text)
-        updated_names = {normalize_card_name(entry.name) for entry in updated_entries}
+        updated_aliases = await resolve_offer_names([entry.name for entry in updated_entries], db)
+        updated_names = {normalize_card_name(updated_aliases.get(fold_search_text(entry.name), entry.name)) for entry in updated_entries}
         retained_overrides = {key: value for key, value in old_overrides.items() if key in updated_names}
         analysis = await SimulatedCollectionService.analyze_raw_text(
             user_id, updated_text, coll.name, coll.description, provider, retained_overrides,
@@ -645,7 +936,7 @@ class SimulatedCollectionService:
             await db.simulatedcard.create(data={
                 "simulatedCollectionId": collection_id,
                 "cardScryfallId": card.cardScryfallId,
-                "selectedPrintingId": retained_overrides.get(norm),
+                "selectedPrintingId": card.selectedPrintingId,
                 "cardName": card.cardName,
                 "quantity": card.quantity,
                 "setCode": card.setCode,
@@ -658,6 +949,8 @@ class SimulatedCollectionService:
             })
             card.acquiredAt = old_acquisition_dates.get(norm) or checkpoint
         analysis.id = collection_id
+        from src.services.acquisition_finance import valuation_revision
+        analysis.valuationRevision = valuation_revision(analysis)
         return analysis
 
     @staticmethod
@@ -665,5 +958,7 @@ class SimulatedCollectionService:
         coll = await db.simulatedcollection.find_unique(where={"id": collection_id})
         if not coll or coll.userId != user_id:
             return False
+        if getattr(coll, "status", None) == "purchased":
+            raise HTTPException(409, "Conserva la oferta comprada como justificante del lote.")
         await db.simulatedcollection.delete(where={"id": collection_id})
         return True

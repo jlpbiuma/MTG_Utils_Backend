@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Optional
+from src.core.db import db
 from src.core.auth import get_current_user_id
 from src.schemas.wants import (
     WantCardCreate,
+    WantBulkRequest,
     WantCardUpdate,
     WantCardUpdateVersion,
     WantCardResponse,
@@ -50,6 +52,33 @@ async def add_or_increment(data: WantCardCreate, user_id: str = Depends(get_curr
             status_code=409,
             detail=f"Ya tienes «{exc.card_name}» en la colección",
         )
+
+
+@router.post("/bulk")
+async def bulk_wants(payload: WantBulkRequest, user_id: str = Depends(get_current_user_id)):
+    from uuid import uuid4
+    from src.services.card_utils import normalize_card_name
+    added, existing = [], []
+    # Serialize per user: repeated submissions cannot create alternate-printing duplicates.
+    async with db.tx() as tx:
+        await tx.execute_raw("SELECT pg_advisory_xact_lock(hashtext($1))", "wants:" + user_id)
+        saved = await tx.wantcard.find_many(where={"userId": user_id})
+        by_name = {normalize_card_name(c.cardName): c for c in saved}
+        seen = set()
+        for card in payload.cards:
+            norm = normalize_card_name(card.cardName)
+            if not norm or norm in seen:
+                continue
+            seen.add(norm)
+            previous = by_name.get(norm)
+            if previous:
+                if previous.quantity < card.quantity:
+                    await tx.wantcard.update(where={"id": previous.id}, data={"quantity": card.quantity})
+                existing.append(card.cardScryfallId)
+            else:
+                await tx.wantcard.create(data={"id": str(uuid4()), "userId": user_id, **card.model_dump()})
+                added.append(card.cardScryfallId)
+    return {"added": added, "existing": existing}
 
 
 @router.patch("/{card_id}", response_model=Optional[WantCardResponse])

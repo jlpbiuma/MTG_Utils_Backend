@@ -1,5 +1,11 @@
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Literal
+from pydantic import Field
+
+
+class ManualOpportunityRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+    subject: Literal["vende", "compra_busca"]
 
 
 class CatalogCardSummary(BaseModel):
@@ -25,6 +31,17 @@ class CollectionMatchInfo(BaseModel):
     available_quantity: int = 0
 
 
+class OpportunityDeckImpact(BaseModel):
+    deck_card_id: str
+    deck_id: str
+    total_cards: int
+    owned_cards: int
+    quantity: int
+    assigned_quantity: int
+    collection_quantity: int
+
+
+
 class WhatsAppDealMatch(BaseModel):
     id: int
     card_name: str
@@ -44,6 +61,14 @@ class WhatsAppDealMatch(BaseModel):
     catalog_card: Optional[CatalogCardSummary] = None
     matched_want: Optional[WantMatchInfo] = None
     matched_collection: Optional[CollectionMatchInfo] = None
+    unit_price: Optional[float] = None
+    price_currency: str = "EUR"
+    price_source: Optional[Literal["link", "cardmarket"]] = None
+    trade_quantity: int = 0
+    trend_unit_price: Optional[float] = None
+    completion_gain: float = 0.0
+    global_completion_after: Optional[float] = None
+    completion_requirements: List[OpportunityDeckImpact] = Field(default_factory=list)
 
 
 class WhatsAppMatchesResponse(BaseModel):
@@ -53,3 +78,5 @@ class WhatsAppMatchesResponse(BaseModel):
     total_collection_matches: int = 0
     total_cards_scanned: int = 0
     last_scraped_at: Optional[str] = None
+    global_deck_count: int = 0
+    global_completion_before: float = 0.0

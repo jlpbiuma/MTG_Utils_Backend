@@ -1,3 +1,5 @@
+from src.schemas.price_statistics import PriceHistoryStatistics
+from src.schemas.whatsapp_deals import WhatsAppMatchesResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Literal
 from datetime import datetime
@@ -16,6 +18,10 @@ class PurchaseGroup(BaseModel):
 
 
 class PurchaseCard(BaseModel):
+    historyPrintingId: Optional[str] = None
+    historyStatistics: Optional[PriceHistoryStatistics] = None
+    referencePrintingId: Optional[str] = None
+    referenceSetCode: Optional[str] = None
     cardName: str
     quantity: int
     collectorNumber: Optional[str] = None
@@ -38,6 +44,9 @@ class PurchaseCard(BaseModel):
 
 
 class PurchaseAnalysis(BaseModel):
+    historyStatistics: Optional[PriceHistoryStatistics] = None
+    historyCoveredCopies: int = 0
+    missingHistoryCopies: int = 0
     currency: str = "EUR"
     totalPurchaseCost: float = 0.0
     totalMarketValue: float = 0.0
@@ -71,11 +80,22 @@ class CandidateDeckInfo(BaseModel):
     assignedQuantity: int
     missingQuantity: int
     potentialGain: float = 0.0
+    totalCards: Optional[int] = None
+    ownedCards: Optional[int] = None
+
+class UpcomingReprint(BaseModel):
+    setCode: str
+    setName: str
+    releaseDate: str
+
 
 class SimulatedCardAnalysisItem(BaseModel):
+    upcomingReprints: List[UpcomingReprint] = Field(default_factory=list)
+    historyStatistics: Optional[PriceHistoryStatistics] = None
     selectedPrintingId: Optional[str] = None
     inWants: bool = False
     cardName: str
+    sourceNames: List[str] = []
     cardScryfallId: Optional[str] = None
     quantity: int
     acquiredAt: Optional[datetime] = None
@@ -97,6 +117,18 @@ class SimulatedCardAnalysisItem(BaseModel):
     candidateDecks: List[CandidateDeckInfo] = []
 
 class SimulatedCollectionSummary(BaseModel):
+    origin: Literal["whatsapp", "cardmarket", "in_person", "other"] = "other"
+    opportunitySubject: Literal["vende", "compra_busca"] = "vende"
+    globalCompletionBefore: float = 0
+    globalCompletionAfter: float = 0
+    opportunityMatches: Optional[WhatsAppMatchesResponse] = None
+    status: Literal["evaluating", "purchased", "discarded"] = "evaluating"
+    seller: Optional[str] = None
+    shipping: float = 0
+    sourceUrl: Optional[str] = None
+    paidTotal: Optional[float] = None
+    confirmedBatchId: Optional[str] = None
+
     purchaseAnalysis: Optional[PurchaseAnalysis] = None
     id: str
     name: str
@@ -115,6 +147,22 @@ class SimulatedCollectionSummary(BaseModel):
     updatedAt: str
 
 class SimulatedCollectionAnalysisResponse(BaseModel):
+    valuationRevision: Optional[str] = None
+    origin: Literal["whatsapp", "cardmarket", "in_person", "other"] = "other"
+    opportunitySubject: Literal["vende", "compra_busca"] = "vende"
+    globalCompletionBefore: float = 0
+    globalCompletionAfter: float = 0
+    opportunityMatches: Optional[WhatsAppMatchesResponse] = None
+    historyStatistics: Optional[PriceHistoryStatistics] = None
+    historyCoveredCopies: int = 0
+    missingHistoryCopies: int = 0
+    status: Literal["evaluating", "purchased", "discarded"] = "evaluating"
+    seller: Optional[str] = None
+    shipping: float = 0
+    sourceUrl: Optional[str] = None
+    paidTotal: Optional[float] = None
+    confirmedBatchId: Optional[str] = None
+
     printingOverrides: dict[str, str] = Field(default_factory=dict)
     rawText: Optional[str] = None
     purchaseAnalysis: Optional[PurchaseAnalysis] = None
@@ -137,12 +185,14 @@ class SimulatedCollectionAnalysisResponse(BaseModel):
 
 
 class SimulatedCollectionCreateRequest(BaseModel):
+    origin: Literal["whatsapp", "cardmarket", "in_person", "other"] = "other"
     printingOverrides: dict[str, str] = Field(default_factory=dict)
     name: str
     description: Optional[str] = None
     rawText: str
 
 class SimulatedCollectionAnalyzeRequest(BaseModel):
+    includeHistory: bool = True
     printingOverrides: dict[str, str] = Field(default_factory=dict)
     rawText: str
     provider: str = "cardmarket"
@@ -156,3 +206,11 @@ class SimulatedCardVersionRequest(BaseModel):
 class SimulatedCollectionCardRequest(BaseModel):
     cardName: str = Field(min_length=1)
     quantity: int = Field(default=1, ge=1, le=999)
+
+
+class OfferLinkImportRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2048)
+    name: Optional[str] = None
+    origin: Literal["whatsapp", "cardmarket", "in_person", "other"] = "other"
+    subject: Literal["vende", "compra_busca"] = "vende"
+    savedOnly: bool = False

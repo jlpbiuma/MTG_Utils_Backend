@@ -276,7 +276,7 @@ def colors_by_deck(deck_cards: List[Any]) -> Dict[str, List[str]]:
     costs: Dict[str, List[Optional[str]]] = {}
     for card in deck_cards or []:
         deck_id = getattr(card, "deckId", None)
-        if not deck_id:
+        if not deck_id or getattr(card, "isSideboard", False) is True:
             continue
         costs.setdefault(deck_id, []).append(getattr(card, "manaCost", None))
     return {
@@ -359,36 +359,42 @@ def is_basic_land(type_line: Optional[str] = None, card_name: Optional[str] = No
     return False
 
 
-def completion_percentages_by_deck(
-    deck_cards: List[Any],
-    collection_by_name: Dict[str, int],
-) -> Dict[str, float]:
-    """Deck completion including basic lands (which are always 100% owned), matching the deck list formula."""
-    totals: Dict[str, List[int]] = {}
+def completion_cards(deck_cards: List[Any]) -> List[Any]:
+    """One mainboard entry per normalized name; quantities never weight completion."""
+    unique = {}
     for card in deck_cards or []:
+        if getattr(card, "isSideboard", False) is True or (getattr(card, "quantity", 0) or 0) <= 0:
+            continue
+        key = (getattr(card, "deckId", None), normalize_card_name(card.cardName))
+        if key not in unique or (getattr(card, "assignedQuantity", 0) or 0) > (getattr(unique[key], "assignedQuantity", 0) or 0):
+            unique[key] = card
+    return list(unique.values())
+
+
+def completion_owned(card: Any, collection_by_name: Dict[str, int]) -> bool:
+    """A single owned/assigned copy covers this name in every requesting deck."""
+    return (is_basic_land(getattr(card, "typeLine", None), card.cardName)
+            or collection_by_name.get(normalize_card_name(card.cardName), 0) > 0
+            or (getattr(card, "assignedQuantity", 0) or 0) > 0)
+
+
+def completion_counts(deck_cards: List[Any], collection_by_name: Dict[str, int]) -> tuple[int, int]:
+    cards = completion_cards(deck_cards)
+    return len(cards), sum(completion_owned(card, collection_by_name) for card in cards)
+
+
+def completion_percentages_by_deck(
+    deck_cards: List[Any], collection_by_name: Dict[str, int],
+) -> Dict[str, float]:
+    totals = {}
+    for card in completion_cards(deck_cards):
         deck_id = getattr(card, "deckId", None)
-        if not deck_id or getattr(card, "isSideboard", False):
+        if not deck_id:
             continue
-        quantity = getattr(card, "quantity", None) or 0
-        if quantity <= 0:
-            continue
-        is_basic = is_basic_land(
-            getattr(card, "typeLine", None),
-            getattr(card, "cardName", None),
-        )
-        if is_basic:
-            actual_owned = quantity
-        else:
-            assigned = getattr(card, "assignedQuantity", None) or 0
-            owned_copies = collection_by_name.get(normalize_card_name(card.cardName), 0)
-            actual_owned = min(quantity, max(assigned, min(owned_copies, quantity)))
         bucket = totals.setdefault(deck_id, [0, 0])
-        bucket[0] += quantity
-        bucket[1] += actual_owned
-    return {
-        deck_id: round((owned / total) * 100, 1) if total else 0.0
-        for deck_id, (total, owned) in totals.items()
-    }
+        bucket[0] += 1
+        bucket[1] += int(completion_owned(card, collection_by_name))
+    return {deck_id: round(owned / total * 100, 1) for deck_id, (total, owned) in totals.items()}
 
 
 def get_card_category(type_line: Optional[str] = None, card_name: Optional[str] = None) -> str:

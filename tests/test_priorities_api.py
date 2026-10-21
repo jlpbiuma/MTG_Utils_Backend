@@ -46,6 +46,7 @@ async def test_priorities_deck_stats_and_completion_accuracy():
     col_ponder.quantity = 1
 
     mock_db = MagicMock()
+    mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.deck.find_many = AsyncMock(return_value=[deck1])
     mock_db.collectioncard.find_many = AsyncMock(return_value=[col_ponder])
     mock_db.cardprinting.find_many = AsyncMock(return_value=[])
@@ -57,7 +58,7 @@ async def test_priorities_deck_stats_and_completion_accuracy():
 
         res = await PriorityService.get_priorities(user_id="user-1")
         assert res.globalDeckCount == 1
-        assert res.globalCompletionBefore == 60.0
+        assert res.globalCompletionBefore == 50.0
 
         # Total cards in deck1 = 2 (Island) + 1 (Brainstorm) + 1 (Ponder) + 1 (Counterspell) = 5
         # Owned = 2 (Island) + 1 (Ponder) = 3
@@ -66,9 +67,9 @@ async def test_priorities_deck_stats_and_completion_accuracy():
         for item in res.items:
             for d in item.decks:
                 if d.deckId == "deck-1":
-                    assert d.deckTotalCards == 5
+                    assert d.deckTotalCards == 4
                     assert d.deckMissingCards == 2
-                    assert d.completionPercentage == 60.0
+                    assert d.completionPercentage == 50.0
 
         # Ponder is owned in collection, so its missingQuantity in deck-1 should be 0
         ponder_item = next((item for item in res.items if item.cardName == "Ponder"), None)
@@ -99,6 +100,7 @@ async def test_priorities_complete_decks_sorting():
     deck_far.cards = [c_far]
 
     mock_db = MagicMock()
+    mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.deck.find_many = AsyncMock(return_value=[deck_near, deck_far])
     mock_db.collectioncard.find_many = AsyncMock(return_value=[])
     mock_db.cardprinting.find_many = AsyncMock(return_value=[])
@@ -157,6 +159,7 @@ async def test_golden_wants_complete_decks_accuracy():
     col_cards = [MagicMock(cardName=c.cardName, quantity=1) for c in owned_deck1]
 
     mock_db = MagicMock()
+    mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.deck.find_many = AsyncMock(return_value=[deck1, deck2])
     mock_db.collectioncard.find_many = AsyncMock(return_value=col_cards)
     mock_db.cardprinting.find_many = AsyncMock(return_value=[])

@@ -57,6 +57,8 @@ class CollectionService:
         colors = colors_by_deck(user_deck_cards)
         decks_by_norm: Dict[str, Dict[str, DeckRequirement]] = {}
         for oc in user_deck_cards or []:
+            if getattr(oc, "isSideboard", False) is True or getattr(getattr(oc, "deck", None), "isArchived", False) is True:
+                continue
             norm = normalize_card_name(oc.cardName)
             deck_obj = getattr(oc, "deck", None)
             d_id = getattr(oc, "deckId", None)
@@ -546,25 +548,27 @@ class CollectionService:
             }
         )
         if conflict:
-            updated = await db.collectioncard.update(
-                where={"id": conflict.id},
-                data={
-                    "quantity": conflict.quantity + card.quantity,
-                    "imageUri": effective_image or conflict.imageUri,
-                    "setCode": set_code if set_code is not None else conflict.setCode,
-                    "collectorNumber": (
-                        collector_number
-                        if collector_number is not None
-                        else conflict.collectorNumber
-                    ),
-                    "acquiredAt": (
-                        getattr(conflict, "acquiredAt", None)
-                        or getattr(card, "acquiredAt", None)
-                        or datetime.now(timezone.utc)
-                    ),
-                },
-            )
-            await db.collectioncard.delete(where={"id": card_id})
+            async with db.tx() as tx:
+                await tx.query_raw("SELECT set_config('mtg.suppress_acquisition', 'on', true)")
+                updated = await tx.collectioncard.update(
+                    where={"id": conflict.id},
+                    data={
+                        "quantity": conflict.quantity + card.quantity,
+                        "imageUri": effective_image or conflict.imageUri,
+                        "setCode": set_code if set_code is not None else conflict.setCode,
+                        "collectorNumber": (
+                            collector_number
+                            if collector_number is not None
+                            else conflict.collectorNumber
+                        ),
+                        "acquiredAt": (
+                            getattr(conflict, "acquiredAt", None)
+                            or getattr(card, "acquiredAt", None)
+                            or datetime.now(timezone.utc)
+                        ),
+                    },
+                )
+                await tx.collectioncard.delete(where={"id": card_id})
         else:
             update_data = {"cardScryfallId": card_scryfall_id}
             if effective_image:

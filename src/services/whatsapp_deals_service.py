@@ -5,6 +5,7 @@ import re
 import sqlite3
 import urllib.parse
 from typing import Any, Dict, List, Optional, Set
+from types import SimpleNamespace
 
 from src.core.config import settings
 from src.core.db import db
@@ -15,9 +16,13 @@ from src.schemas.whatsapp_deals import (
     WhatsAppDealMatch,
     WhatsAppMatchesResponse,
 )
-from src.services.card_utils import normalize_card_name
+from src.services.card_utils import normalize_card_name, is_basic_land, completion_cards, completion_owned
 from src.services.image_resolver import resolve_minio_image_uris, safe_image_uri
 from src.services.want_service import WantService
+from src.services.manual_opportunity_store import read_saved_rows
+from datetime import datetime
+from src.services.opportunity_valuation import value_matches
+from src.services.opportunity_completion import enrich_completion
 
 logger = logging.getLogger("mtg_backend.whatsapp_deals")
 
@@ -49,11 +54,53 @@ class WhatsAppDealsService:
         user_id: str,
         custom_db_path: Optional[str] = None,
     ) -> WhatsAppMatchesResponse:
+        automatic = await WhatsAppDealsService._get_automatic_matches(user_id, custom_db_path)
+        rows = await read_saved_rows(user_id)
+        if not rows:
+            if not automatic.global_deck_count and not automatic.wants_matches and not automatic.collection_matches:
+                decks = await db.deck.find_many(
+                    where={"userId": user_id, "isArchived": False}, include={"cards": True},
+                )
+                collection = await db.collectioncard.find_many(where={"userId": user_id})
+                cards = [card for deck in decks for card in (deck.cards or [])]
+                automatic.global_deck_count, automatic.global_completion_before = enrich_completion([], decks, cards, collection)
+            return automatic
+        manual = await WhatsAppDealsService.match_rows(
+            user_id, rows, total_scanned=len(rows), last_scraped=rows[0]["detected_at"], manual=True,
+        )
+        timestamps = [value for value in [automatic.last_scraped_at, manual.last_scraped_at] if value]
+        return WhatsAppMatchesResponse(
+            wants_matches=automatic.wants_matches + manual.wants_matches,
+            collection_matches=automatic.collection_matches + manual.collection_matches,
+            total_wants_matches=automatic.total_wants_matches + manual.total_wants_matches,
+            total_collection_matches=automatic.total_collection_matches + manual.total_collection_matches,
+            total_cards_scanned=automatic.total_cards_scanned + manual.total_cards_scanned,
+            last_scraped_at=max(timestamps, key=datetime.fromisoformat) if timestamps else None,
+            global_deck_count=manual.global_deck_count,
+            global_completion_before=manual.global_completion_before,
+        )
+
+    @staticmethod
+    async def _get_automatic_matches(user_id: str, custom_db_path: Optional[str] = None) -> WhatsAppMatchesResponse:
         db_path = _get_sqlite_path(custom_db_path)
         if not db_path:
             logger.info("Base de datos de WhatsApp no encontrada; devolviendo lista vacía.")
             return WhatsAppMatchesResponse()
 
+        rows, total_scanned, last_scraped = WhatsAppDealsService.read_automatic_rows(db_path)
+
+        if not rows:
+            return WhatsAppMatchesResponse(
+                total_cards_scanned=total_scanned,
+                last_scraped_at=last_scraped,
+            )
+
+        return await WhatsAppDealsService.match_rows(
+            user_id, rows, total_scanned=total_scanned, last_scraped=last_scraped,
+        )
+
+    @staticmethod
+    def read_automatic_rows(db_path):
         # 1. Leer extracted_cards de SQLite en modo solo lectura
         rows = []
         last_scraped: Optional[str] = None
@@ -97,16 +144,20 @@ class WhatsAppDealsService:
             conn.close()
         except Exception as exc:
             logger.error("Error al leer base de datos de WhatsApp (%s): %s", db_path, exc)
-            return WhatsAppMatchesResponse()
+            return [], 0, None
 
-        if not rows:
-            return WhatsAppMatchesResponse(
-                total_cards_scanned=total_scanned,
-                last_scraped_at=last_scraped,
-            )
-
+        return rows, total_scanned, last_scraped
+    @staticmethod
+    async def match_rows(
+        user_id: str,
+        rows: List[Any],
+        *,
+        total_scanned: int,
+        last_scraped: Optional[str] = None,
+        manual: bool = False,
+    ) -> WhatsAppMatchesResponse:
         # 2. Consultar Wants del usuario
-        user_wants = await db.wantcard.find_many(where={"userId": user_id})
+        user_wants = [] if manual else await db.wantcard.find_many(where={"userId": user_id})
         wants_by_norm: Dict[str, List[Any]] = {}
         for w in user_wants:
             norm = normalize_card_name(w.cardName)
@@ -114,7 +165,7 @@ class WhatsAppDealsService:
                 wants_by_norm.setdefault(norm, []).append(w)
 
         # Demanda de mazos por carta
-        decks_by_norm = await WantService._deck_demand_by_name(user_id)
+        decks_by_norm = {} if manual else await WantService._deck_demand_by_name(user_id)
 
         # 3. Consultar Colección del usuario
         user_collection = await db.collectioncard.find_many(where={"userId": user_id})
@@ -126,13 +177,32 @@ class WhatsAppDealsService:
 
         # Asignaciones de copias en mazos
         deck_cards = await db.deckcard.find_many(
-            where={"deck": {"userId": user_id}}
+            where={"deck": {"userId": user_id, "isArchived": False}},
+            include={"deck": True},
         )
         assigned_by_norm: Dict[str, int] = {}
         for dc in deck_cards:
             norm = normalize_card_name(dc.cardName)
             if norm:
-                assigned_by_norm[norm] = assigned_by_norm.get(norm, 0) + (getattr(dc, "quantity", 1) or 1)
+                assigned_by_norm[norm] = assigned_by_norm.get(norm, 0) + (getattr(dc, "assignedQuantity", 0) or 0)
+
+        active_decks = await db.deck.find_many(where={"userId": user_id, "isArchived": False})
+
+        if manual:
+            # Follow the ownership rule of DeckService: reprints are equivalent,
+            # basic lands are complete, and only active decks contribute demand.
+            wants_by_norm = {}
+            decks_by_norm = {}
+            for dc in completion_cards(deck_cards):
+                norm = normalize_card_name(dc.cardName)
+                if not norm or is_basic_land(dc.typeLine, dc.cardName):
+                    continue
+                owned = sum(c.quantity for c in col_by_norm.get(norm, []))
+                missing = int(not completion_owned(dc, {norm: owned}))
+                if not missing:
+                    continue
+                wants_by_norm.setdefault(norm, []).append(SimpleNamespace(id="", quantity=missing))
+                decks_by_norm.setdefault(norm, {})[dc.deckId] = SimpleNamespace(deckName=dc.deck.name)
 
         # 4. Obtener catálogo para enriquecer información visual y precios
         all_norm_matched: Set[str] = set()
@@ -198,7 +268,7 @@ class WhatsAppDealsService:
             # Cruce 1: Venta en WhatsApp vs Mis Wants (Oportunidades de Compra)
             if subj == "vende" and norm in wants_by_norm:
                 want_items = wants_by_norm[norm]
-                qty_wanted = sum(getattr(w, "quantity", 1) or 1 for w in want_items)
+                qty_wanted = 1 if manual else sum(getattr(w, "quantity", 1) or 1 for w in want_items)
                 req_decks = [
                     d.deckName for d in decks_by_norm.get(norm, {}).values()
                 ]
@@ -218,7 +288,7 @@ class WhatsAppDealsService:
                     source_chat=r["source_chat"],
                     raw_message=r["raw_message"],
                     detected_at=r["detected_at"],
-                    direct_whatsapp_link=_format_whatsapp_link(r["source_phone"] or "", wa_msg),
+                    direct_whatsapp_link="" if manual else _format_whatsapp_link(r["source_phone"] or "", wa_msg),
                     extra=extra,
                     catalog_card=cat_summary,
                     matched_want=WantMatchInfo(
@@ -236,6 +306,9 @@ class WhatsAppDealsService:
                 qty_assigned = assigned_by_norm.get(norm, 0)
                 qty_free = max(0, qty_owned - qty_assigned)
 
+                if manual and qty_free == 0:
+                    continue
+
                 wa_msg = f"¡Hola! Te escribo por el grupo de Magic porque he visto que buscas «{card_name}». Tengo copias disponibles en mi colección..."
                 match_item = WhatsAppDealMatch(
                     id=r["id"],
@@ -251,7 +324,7 @@ class WhatsAppDealsService:
                     source_chat=r["source_chat"],
                     raw_message=r["raw_message"],
                     detected_at=r["detected_at"],
-                    direct_whatsapp_link=_format_whatsapp_link(r["source_phone"] or "", wa_msg),
+                    direct_whatsapp_link="" if manual else _format_whatsapp_link(r["source_phone"] or "", wa_msg),
                     extra=extra,
                     catalog_card=cat_summary,
                     matched_collection=CollectionMatchInfo(
@@ -262,7 +335,10 @@ class WhatsAppDealsService:
                 )
                 collection_matches.append(match_item)
 
+        await value_matches(wants_matches + collection_matches)
+        deck_count, completion_before = enrich_completion(wants_matches, active_decks, deck_cards, user_collection)
         return WhatsAppMatchesResponse(
+            global_deck_count=deck_count, global_completion_before=completion_before,
             wants_matches=wants_matches,
             collection_matches=collection_matches,
             total_wants_matches=len(wants_matches),

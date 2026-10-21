@@ -73,3 +73,6 @@ class WantQueryResponse(BaseModel):
     uniqueCards: int = 0
     sections: List[WantGroupSection] = []
     cards: List[WantCardResponse] = []
+
+class WantBulkRequest(BaseModel):
+    cards: List[WantCardCreate] = Field(min_length=1, max_length=500)

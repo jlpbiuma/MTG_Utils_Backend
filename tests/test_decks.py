@@ -304,7 +304,7 @@ async def test_get_deck_detail_missing_count_is_collection_aware():
     assert by_name["Mana Crypt"].missingCount == 1
 
     assert detail.totalCards == 7
-    assert detail.ownedCards == 5
+    assert detail.ownedCards == 2
     assert detail.missingCards == 2
 
 @pytest.mark.asyncio
@@ -369,7 +369,7 @@ async def test_get_user_decks_excludes_basic_lands_from_completion():
     summary = decks[0]
     # 30 Basics are automatically owned, plus 3 non-basics/commander owned in collection -> 100% completion
     assert summary.totalCards == 33
-    assert summary.ownedCards == 33
+    assert summary.ownedCards == 4
     assert summary.missingCards == 0
     assert summary.completionPercentage == 100
 
@@ -424,7 +424,7 @@ async def test_get_deck_detail_excludes_basic_lands_from_completion():
     assert detail is not None
     # 25 Mountains + 1 Command Tower + 1 Purphoros (commander) = 27 total cards
     assert detail.totalCards == 27
-    assert detail.ownedCards == 25
+    assert detail.ownedCards == 1
     assert detail.missingCards == 2
 
     by_name = {c.cardName: c for c in detail.cards}
@@ -650,21 +650,20 @@ async def test_get_deck_detail_reports_requested_in_decks():
     signet = next(c for c in detail.cards if c.cardName == "Arcane Signet")
     assert signet.missingCount == 1
 
-    # Should report 3 decks requesting Arcane Signet: Tidus, Atraxa, Urza
-    assert signet.requestedInDecksCount == 3
+    # Only mainboard demand counts: Tidus and Atraxa. Urza requests it in sideboard.
+    assert signet.requestedInDecksCount == 2
     deck_names = [req.deckName for req in signet.requestedInDecks]
     assert "Mazo Tidus" in deck_names
-    assert "Urza Lord High" in deck_names
+    assert "Urza Lord High" not in deck_names
     assert "Atraxa Proliferate" in deck_names
-    urza_requirement = next(req for req in signet.requestedInDecks if req.deckId == "deck-urza")
-    assert urza_requirement.isSideboard is True
 
     # Current deck comes first
     assert signet.requestedInDecks[0].deckId == "deck-tidus"
 
 
 @pytest.mark.asyncio
-async def test_add_missing_card_to_collection_single():
+@pytest.mark.parametrize("quantity", [1, 7])
+async def test_add_missing_card_to_collection_single(quantity):
     # Card in deck that is missing
     mock_deck = MagicMock()
     mock_deck.id = "deck-1"
@@ -675,7 +674,7 @@ async def test_add_missing_card_to_collection_single():
         deckId="deck-1",
         cardScryfallId="sol-ring-id",
         cardName="Sol Ring",
-        quantity=1,
+        quantity=quantity,
         assignedQuantity=0,
         manaCost="{1}",
         typeLine="Artifact",
@@ -684,6 +683,8 @@ async def test_add_missing_card_to_collection_single():
     )
 
     mock_db = MagicMock()
+    mock_db.tx.return_value.__aenter__.return_value = mock_db
+    mock_db.query_raw = AsyncMock()
     mock_db.deckcard.find_unique = AsyncMock(return_value=mock_card)
     mock_db.deckcard.update = AsyncMock()
     mock_db.collectioncard.find_unique = AsyncMock(return_value=None)
@@ -707,11 +708,10 @@ async def test_add_missing_card_to_collection_single():
     assert create_args["cardName"] == "Sol Ring"
     assert create_args["quantity"] == 1
 
-    # Should have assigned card to deck
-    mock_db.deckcard.update.assert_called_once_with(
-        where={"id": "card-sol-ring"},
-        data={"assignedQuantity": 1}
-    )
+    # PostgreSQL assigns and emits the notice in the inventory transaction.
+    # A second application-level assignment would duplicate physical copies.
+    mock_db.deckcard.update.assert_not_called()
+    assert mock_db.query_raw.await_args.args[1] == "deck-1"
 
 
 @pytest.mark.asyncio
@@ -731,9 +731,9 @@ async def test_add_missing_cards_to_collection_bulk():
         id="c2",
         cardScryfallId="id-2",
         cardName="Sol Ring",
-        missingCount=2,
+        missingCount=1,
         assignedQuantity=0,
-        quantity=2,
+        quantity=7,
         manaCost="{1}",
         typeLine="Artifact",
         imageUri="https://example.com/ring.jpg",
@@ -741,6 +741,8 @@ async def test_add_missing_cards_to_collection_bulk():
     mock_detail = MagicMock(cards=[mock_card1, mock_card2])
 
     mock_db = MagicMock()
+    mock_db.tx.return_value.__aenter__.return_value = mock_db
+    mock_db.query_raw = AsyncMock()
     mock_db.collectioncard.find_unique = AsyncMock(return_value=None)
     mock_db.collectioncard.find_first = AsyncMock(return_value=None)
     mock_db.collectioncard.create = AsyncMock()
@@ -751,12 +753,12 @@ async def test_add_missing_cards_to_collection_bulk():
         result = await DeckService.add_missing_cards_to_collection("deck-test", "user-1")
 
     assert result["status"] == "success"
-    assert result["addedCount"] == 3  # 1 + 2
+    assert result["addedCount"] == 2  # one per missing name
 
     # Should have created collection cards for both
     assert mock_db.collectioncard.create.call_count == 2
-    # Should have updated assignedQuantity for both deck cards
-    assert mock_db.deckcard.update.call_count == 2
-    mock_db.deckcard.update.assert_any_call(where={"id": "c1"}, data={"assignedQuantity": 1})
-    mock_db.deckcard.update.assert_any_call(where={"id": "c2"}, data={"assignedQuantity": 2})
+    mock_db.deckcard.update.assert_not_called()
+    mock_db.query_raw.assert_awaited_once_with(
+        "SELECT set_config('mtg.preferred_deck', $1, true)", "deck-test"
+    )
 

@@ -1,3 +1,4 @@
+from src.schemas.price_statistics import PriceHistoryStatistics
 from pydantic import BaseModel, Field, model_validator
 from typing import Optional, Dict, List, Literal
 from datetime import datetime
@@ -94,6 +95,7 @@ class CardPrintingResponse(BaseModel):
     catalogId: Optional[str] = None
     setCode: str
     collectorNumber: str
+    isBasePrinting: bool = True
     rarity: Optional[str] = None
     imageUri: Optional[str] = None
     imageUriSmall: Optional[str] = None
@@ -116,10 +118,14 @@ class CardPrintingResponse(BaseModel):
     acquisitionTrendPercentageChange: Optional[float] = None
 
 class CardSetResponse(BaseModel):
+    valuesAvailable: bool = True
+    batchCount: int = 0
+    roi: Optional[float] = None
     code: str
     name: str
     setType: str
     cardCount: int
+    alternativeVersionCount: int = 0
     releasedAt: Optional[datetime] = None
     iconSvgUri: Optional[str] = None
     ownedCount: int = 0
@@ -189,6 +195,8 @@ class CardExpansionRelease(BaseModel):
 
 
 class PrintingPriceSeries(BaseModel):
+    statistics: PriceHistoryStatistics | None = None
+    foilStatistics: PriceHistoryStatistics | None = None
     printingId: str
     setCode: str
     collectorNumber: str

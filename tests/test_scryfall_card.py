@@ -69,7 +69,7 @@ async def test_card_details_resolves_printing_id_to_catalog_cache():
         )
 
     assert result["id"] == "catalog-sol-ring"
-    find_unique_printing.assert_awaited_once_with(where={"id": "printing-sol-ring"})
+    find_unique_printing.assert_awaited_once_with(where={"id": "printing-sol-ring"}, include={"catalog": True})
 
 
 @pytest.mark.asyncio

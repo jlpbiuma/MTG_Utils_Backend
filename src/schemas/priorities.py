@@ -31,6 +31,7 @@ class PriorityPricePoint(BaseModel):
 
 
 class PriorityItem(BaseModel):
+    inWants: bool = False
     cardName: str
     cardScryfallId: str
     imageUri: Optional[str] = None

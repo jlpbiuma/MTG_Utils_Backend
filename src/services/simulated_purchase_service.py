@@ -51,6 +51,14 @@ def compare_purchase(cart: CartImport, printings: list[Any], wants: list[Any],
         exact = [p for p in candidates if entry.set_name and entry.collector_number
                  and str(getattr(p, "collectorNumber", "")) == entry.collector_number
                  and _set_key(getattr(getattr(p, "set", None), "name", "")) == _set_key(entry.set_name)]
+        # Cardmarket product slugs do not always use the same set name as the
+        # local catalog for special releases. A collector number still
+        # identifies the printing when it occurs only once for that card.
+        if not exact and entry.collector_number:
+            number_matches = [p for p in candidates
+                              if str(getattr(p, "collectorNumber", "")) == entry.collector_number]
+            if len(number_matches) == 1:
+                exact = number_matches
         if norm in (printing_overrides or {}):
             exact = [p for p in candidates if p.id == printing_overrides[norm]]
             candidates = exact  # Explicit selections never fall back to a different edition.
@@ -82,7 +90,12 @@ def compare_purchase(cart: CartImport, printings: list[Any], wants: list[Any],
                 group.comparedCopies += quantity
                 sums[key]["comparedCost"] += entry.unit_price * quantity
                 sums[key]["comparedMarketValue"] += market * quantity
+        resolved_identity = exact[0] if len(exact) == 1 else None
+        historical_printing = printing or resolved_identity
         rows.append(PurchaseCard(
+            historyPrintingId=historical_printing.id if historical_printing else None,
+            referencePrintingId=resolved_identity.id if resolved_identity else None,
+            referenceSetCode=getattr(getattr(resolved_identity, "set", None), "code", None) if resolved_identity else None,
             cardName=entry.name, quantity=entry.quantity, collectorNumber=entry.collector_number,
             setName=entry.set_name, sourceUrl=entry.source_url, condition=entry.condition, isFoil=entry.is_foil,
             purchaseUnitPrice=float(entry.unit_price) if entry.unit_price is not None else None,

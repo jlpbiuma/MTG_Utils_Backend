@@ -1,4 +1,5 @@
 import re
+from datetime import timedelta
 import logging
 import asyncio
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from src.services.card_utils import (
     is_basic_land,
     extract_colors_from_mana_cost,
     combine_colors_from_mana_costs,
-    completion_percentages_by_deck,
+    completion_percentages_by_deck, completion_counts, completion_owned, completion_cards,
     colors_by_deck,
 )
 from src.services.scryfall_service import ScryfallService
@@ -84,7 +85,7 @@ async def _is_commander_eligible(card_name: str, type_line: Optional[str]) -> bo
 
 class DeckService:
     @staticmethod
-    async def get_user_decks(user_id: str) -> List[DeckSummaryResponse]:
+    async def get_user_decks(user_id: str, provider: str = DECK_PRICE_PROVIDER) -> List[DeckSummaryResponse]:
         decks, collection_cards = await asyncio.gather(
             db.deck.find_many(
                 where={"userId": user_id},
@@ -133,8 +134,8 @@ class DeckService:
 
         batch_quotes = await PricingService.get_latest_quotes_batch(
             unique_cards,
-            DECK_PRICE_PROVIDER,
-            DECK_PRICE_CURRENCY,
+            provider,
+            "USD" if provider == "mtggoldfish" else "EUR",
         )
         for card in unique_cards:
             cid = card.get("scryfallId") or ""
@@ -177,18 +178,17 @@ class DeckService:
                     typeLine="Legendary Creature",
                 ))
 
-            unique = len(cards)
+            unique = completion_counts(cards, col_map)[0]
 
-            # Calculate owned. Basic lands never count toward completion:
-            # they are excluded from both the numerator (owned) and the
-            # denominator (total), but still contribute to the deck's value.
+            # Quantities drive market valuation. Completion below counts unique
+            # mainboard names, with basic lands always covered.
             total = 0
             owned = 0
             total_value = 0.0
             missing_value = 0.0
             owned_value = 0.0
             for c in cards:
-                if c.isSideboard and not getattr(c, "isCommander", False):
+                if c.isSideboard:
                     continue
 
                 norm = normalize_card_name(c.cardName)
@@ -199,7 +199,7 @@ class DeckService:
                 else:
                     in_col = col_map.get(norm, 0)
                     assigned = getattr(c, "assignedQuantity", 0) or 0
-                    actual_owned = min(c.quantity, max(assigned, min(in_col, c.quantity)))
+                    actual_owned = min(c.quantity, max(getattr(c, "assignedQuantity", 0) or 0, col_map.get(norm, 0)))
 
                 total += c.quantity
                 owned += actual_owned
@@ -209,9 +209,10 @@ class DeckService:
                 missing_value += unit * (c.quantity - actual_owned)
                 owned_value += unit * actual_owned
 
-            missing = max(0, total - owned)
-            pct = round((owned / total) * 100, 1) if total > 0 else 0.0
-            colors = combine_colors_from_mana_costs([c.manaCost for c in cards])
+            completion_total, owned = completion_counts(cards, col_map)
+            missing = max(0, completion_total - owned)
+            pct = round((owned / completion_total) * 100, 1) if completion_total else 0.0
+            colors = combine_colors_from_mana_costs([c.manaCost for c in cards if not c.isSideboard])
 
             cmd_norm = normalize_card_name(d.commander) if d.commander else ""
             is_top100 = cmd_norm in top100_map if cmd_norm else False
@@ -242,14 +243,14 @@ class DeckService:
                 totalValue=round(total_value, 2) if total_value else None,
                 missingValue=round(missing_value, 2) if missing_value else None,
                 ownedValue=round(owned_value, 2) if owned_value else None,
-                currency=DECK_PRICE_CURRENCY,
-                currencySymbol=DECK_PRICE_SYMBOL,
+                currency="USD" if provider == "mtggoldfish" else "EUR",
+                currencySymbol="$" if provider == "mtggoldfish" else "€",
             ))
 
         return summaries
 
     @staticmethod
-    async def get_deck_detail(deck_id: str, user_id: str) -> Optional[DeckDetailResponse]:
+    async def get_deck_detail(deck_id: str, user_id: str, provider: str = DECK_PRICE_PROVIDER) -> Optional[DeckDetailResponse]:
         deck = await db.deck.find_unique(
             where={"id": deck_id},
             include={"cards": True}
@@ -295,6 +296,8 @@ class DeckService:
         # Seed requested_in_decks with the current deck's cards
         decks_by_norm: Dict[str, Dict[str, DeckRequirement]] = {}
         for c in deck_cards:
+            if c.isSideboard:
+                continue
             norm = normalize_card_name(c.cardName)
             if norm not in decks_by_norm:
                 decks_by_norm[norm] = {}
@@ -316,6 +319,8 @@ class DeckService:
         )
         assigned_in_others: Dict[str, List[OtherDeckAssignment]] = {}
         for oc in (user_deck_cards or []):
+            if getattr(oc, "isSideboard", False) is True or getattr(getattr(oc, "deck", None), "isArchived", False) is True:
+                continue
             norm = normalize_card_name(oc.cardName)
             # 1. Assigned copies in other decks
             if oc.deckId != deck_id and (oc.assignedQuantity or 0) > 0:
@@ -367,8 +372,8 @@ class DeckService:
         try:
             batch_quotes = await PricingService.get_latest_quotes_batch(
                 unique_deck_cards,
-                DECK_PRICE_PROVIDER,
-                DECK_PRICE_CURRENCY,
+                provider,
+                "USD" if provider == "mtggoldfish" else "EUR",
             )
             for card in unique_deck_cards:
                 cid = card["scryfallId"]
@@ -386,6 +391,21 @@ class DeckService:
                 norm = normalize_card_name(card["name"])
                 if norm:
                     price_memo[norm] = None
+
+        # Local bulk metadata enriches analytics in one query, with no remote waterfall.
+        rule_metadata = {}
+        try:
+            names = list({normalize_card_name(c.cardName) for c in deck_cards})
+            metadata_rows = await db.query_raw("""SELECT DISTINCT ON (split_part(b.name_key,' // ',1)) split_part(b.name_key,' // ',1) AS name_key,b.payload
+              FROM scryfall_bulk_cards b JOIN scryfall_bulk_state state ON state.generation=b.generation
+              WHERE split_part(b.name_key,' // ',1)=ANY($1::text[]) AND b.lang='en' ORDER BY split_part(b.name_key,' // ',1),b.id""", names)
+            for row in metadata_rows:
+                payload = row['payload']
+                if isinstance(payload, dict):
+                    text = payload.get('oracle_text') or '\n'.join(f.get('oracle_text','') for f in payload.get('card_faces',[]))
+                    rule_metadata[row['name_key']] = (text, payload.get('produced_mana',[]))
+        except Exception:
+            logger.debug("Local rules metadata unavailable for deck analytics")
 
         cards_with_ownership: List[DeckCardWithOwnership] = []
         total = 0
@@ -409,18 +429,19 @@ class DeckService:
                 actual_owned = c.quantity
                 missing = 0
             else:
-                actual_owned = min(c.quantity, max(c.assignedQuantity or 0, min(col_qty, c.quantity)))
-                missing = max(0, c.quantity - actual_owned)
+                actual_owned = min(c.quantity, max(getattr(c, "assignedQuantity", 0) or 0, col_map.get(norm, 0)))
+                missing = int(not c.isSideboard and not completion_owned(c, col_map))
 
-            if not c.isSideboard or getattr(c, "isCommander", False):
+            if not c.isSideboard:
                 total += c.quantity
                 owned += actual_owned
 
             unit = (price_memo.get(c.cardScryfallId) if c.cardScryfallId else None) or price_memo.get(norm) or 0.0
 
-            total_value += unit * c.quantity
-            missing_value += unit * missing
-            owned_value += unit * actual_owned
+            if not c.isSideboard:
+                total_value += unit * c.quantity
+                missing_value += unit * (c.quantity - actual_owned)
+                owned_value += unit * actual_owned
 
             # Auto-enrich type line if missing
             type_line = c.typeLine
@@ -464,6 +485,8 @@ class DeckService:
             req_count = len(req_list)
 
             cards_with_ownership.append(DeckCardWithOwnership(
+                oracleText=rule_metadata.get(norm, (None, []))[0],
+                producedMana=rule_metadata.get(norm, (None, []))[1],
                 id=c.id,
                 deckId=c.deckId,
                 cardScryfallId=c.cardScryfallId,
@@ -486,8 +509,9 @@ class DeckService:
                 tags=[t.strip() for t in (c.tags or "").split(",") if t.strip()],
             ))
 
-        missing_cards = max(0, total - owned)
-        pct = round((owned / total) * 100, 1) if total > 0 else 0.0
+        completion_total, owned = completion_counts(deck_cards, col_map)
+        missing_cards = max(0, completion_total - owned)
+        pct = round((owned / completion_total) * 100, 1) if completion_total else 0.0
 
         net_val = round(total_value, 2) if total_value else None
         miss_val = round(missing_value, 2) if missing_value else None
@@ -520,15 +544,15 @@ class DeckService:
             createdAt=deck.createdAt,
             updatedAt=deck.updatedAt,
             totalCards=total,
-            uniqueCards=len(cards_with_ownership),
+            uniqueCards=completion_total,
             ownedCards=owned,
             missingCards=missing_cards,
             completionPercentage=pct,
             totalValue=net_val,
             missingValue=miss_val,
             ownedValue=own_val,
-            currency=DECK_PRICE_CURRENCY,
-            currencySymbol=DECK_PRICE_SYMBOL,
+            currency="USD" if provider == "mtggoldfish" else "EUR",
+            currencySymbol="$" if provider == "mtggoldfish" else "€",
             cards=cards_with_ownership,
         )
 
@@ -1207,29 +1231,35 @@ class DeckService:
 
     @staticmethod
     async def add_missing_cards_to_collection(deck_id: str, user_id: str) -> Dict[str, Any]:
+        async with db.tx(timeout=timedelta(seconds=30)) as tx:
+            await tx.query_raw("SELECT set_config('mtg.preferred_deck', $1, true)", deck_id)
+            return await DeckService._add_missing_cards_to_collection(deck_id, user_id, tx)
+
+    @staticmethod
+    async def _add_missing_cards_to_collection(deck_id: str, user_id: str, tx) -> Dict[str, Any]:
         detail = await DeckService.get_deck_detail(deck_id, user_id)
         if not detail:
             return {"status": "error", "addedCount": 0}
 
         added = 0
-        for card in detail.cards:
-            missing = card.missingCount
+        for card in completion_cards(detail.cards):
+            missing = int(card.missingCount > 0)
             if missing > 0:
-                existing = await db.collectioncard.find_unique(
+                existing = await tx.collectioncard.find_unique(
                     where={"userId_cardScryfallId": {"userId": user_id, "cardScryfallId": card.cardScryfallId, "isFoil": False}}
                 )
                 if not existing:
-                    existing = await db.collectioncard.find_first(
+                    existing = await tx.collectioncard.find_first(
                         where={"userId": user_id, "cardName": {"equals": card.cardName, "mode": "insensitive"}, "isFoil": False}
                     )
 
                 if existing:
-                    await db.collectioncard.update(
+                    await tx.collectioncard.update(
                         where={"id": existing.id},
                         data={"quantity": existing.quantity + missing}
                     )
                 else:
-                    await db.collectioncard.create(
+                    await tx.collectioncard.create(
                         data={
                             "userId": user_id,
                             "cardScryfallId": card.cardScryfallId,
@@ -1242,45 +1272,47 @@ class DeckService:
                     )
                 added += missing
 
-            # Ensure the card is assigned to this deck
-            if card.assignedQuantity < card.quantity:
-                await db.deckcard.update(
-                    where={"id": card.id},
-                    data={"assignedQuantity": card.quantity}
-                )
 
         return {"status": "success", "addedCount": added}
 
     @staticmethod
     async def add_missing_card_to_collection(card_id: str, user_id: str) -> Dict[str, Any]:
-        card = await db.deckcard.find_unique(where={"id": card_id}, include={"deck": True})
+        async with db.tx(timeout=timedelta(seconds=30)) as tx:
+            return await DeckService._add_missing_card_to_collection(card_id, user_id, tx)
+
+    @staticmethod
+    async def _add_missing_card_to_collection(card_id: str, user_id: str, tx) -> Dict[str, Any]:
+        card = await tx.deckcard.find_unique(where={"id": card_id}, include={"deck": True})
         if not card or not card.deck or card.deck.userId != user_id:
             return {"status": "error", "message": "Carta o mazo no encontrado", "addedCount": 0}
 
+        await tx.query_raw("SELECT set_config('mtg.preferred_deck', $1, true)", card.deckId)
         detail = await DeckService.get_deck_detail(card.deckId, user_id)
         if not detail:
             return {"status": "error", "message": "No se pudo cargar el detalle del mazo", "addedCount": 0}
 
         deck_card = next((c for c in detail.cards if c.id == card_id), None)
-        missing = deck_card.missingCount if deck_card else max(0, card.quantity - card.assignedQuantity)
+        missing = int(deck_card.missingCount > 0) if deck_card else int(card.assignedQuantity <= 0)
+        if getattr(card, "isSideboard", False) is True:
+            missing = 0
 
         added = 0
         if missing > 0:
-            existing = await db.collectioncard.find_unique(
+            existing = await tx.collectioncard.find_unique(
                 where={"userId_cardScryfallId": {"userId": user_id, "cardScryfallId": card.cardScryfallId, "isFoil": False}}
             )
             if not existing:
-                existing = await db.collectioncard.find_first(
+                existing = await tx.collectioncard.find_first(
                     where={"userId": user_id, "cardName": {"equals": card.cardName, "mode": "insensitive"}, "isFoil": False}
                 )
 
             if existing:
-                await db.collectioncard.update(
+                await tx.collectioncard.update(
                     where={"id": existing.id},
                     data={"quantity": existing.quantity + missing}
                 )
             else:
-                await db.collectioncard.create(
+                await tx.collectioncard.create(
                     data={
                         "userId": user_id,
                         "cardScryfallId": card.cardScryfallId,
@@ -1292,12 +1324,6 @@ class DeckService:
                     }
                 )
             added = missing
-
-        # Ensure assigned in this deck
-        await db.deckcard.update(
-            where={"id": card.id},
-            data={"assignedQuantity": card.quantity}
-        )
 
         return {"status": "success", "addedCount": added}
 

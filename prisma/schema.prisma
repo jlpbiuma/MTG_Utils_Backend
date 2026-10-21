@@ -4,12 +4,14 @@ datasource db {
 }
 
 generator client {
+  enable_experimental_decimal = true
   provider             = "prisma-client-py"
   interface            = "asyncio"
   recursive_type_depth = 5
 }
 
 model Deck {
+  assignmentNotices DeckAssignmentNotice[]
   id                  String     @id @default(uuid())
   userId              String     @map("user_id")
   name                String
@@ -51,6 +53,7 @@ model DeckCard {
 }
 
 model CollectionCard {
+  acquisitionItems AcquisitionBatchItem[]
   id              String   @id @default(uuid())
   userId          String   @map("user_id")
   cardScryfallId  String   @map("card_scryfall_id")
@@ -278,6 +281,7 @@ model RulesSyncState {
 }
 
 model CollectionImport {
+  replayResult Json? @map("replay_result")
   id String @id
   userId String @map("user_id")
   requestKey String @map("request_key")
@@ -341,6 +345,15 @@ model ScryfallBulkState {
 }
 
 model SimulatedCollection {
+  origin String @default("other")
+  opportunitySubject String @default("vende") @map("opportunity_subject")
+  sourceMetadata Json? @map("source_metadata")
+  status String @default("evaluating")
+  seller String?
+  shipping Decimal @default(0) @db.Decimal(12, 2)
+  sourceUrl String? @map("source_url")
+  paidTotal Decimal? @map("paid_total") @db.Decimal(12, 2)
+  confirmedBatchId String? @map("confirmed_batch_id")
   id          String          @id @default(uuid())
   userId      String          @map("user_id")
   name        String
@@ -460,3 +473,130 @@ model EdhrecCommander {
   @@map("edhrec_commanders")
 }
 
+
+// A lot owns quantities, because inventory merges repeat purchases of one printing.
+model AcquisitionBatch {
+  name String?
+  purchaseOrigin String @default("other") @map("purchase_origin")
+  seller String?
+  sourceUrl String? @map("source_url")
+  costBasis String @default("paid") @map("cost_basis")
+  fee Decimal @default(0) @db.Decimal(12, 2)
+  annulledAt DateTime? @map("annulled_at")
+  purchaseKey String? @map("purchase_key")
+  updatedAt DateTime @default(now()) @map("updated_at")
+  quotes AcquisitionQuote[]
+  id String @id @default(uuid())
+  userId String @map("user_id")
+  setCode String? @map("set_code")
+  kind String
+  acquiredOn DateTime @map("acquired_on") @db.Date
+  costTotal Decimal @map("cost_total") @db.Decimal(12, 2)
+  shipping Decimal @default(0) @db.Decimal(12, 2)
+  currency String @default("EUR")
+  notes String?
+  origin String @default("manual")
+  offerId String? @unique @map("offer_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  items AcquisitionBatchItem[]
+  @@index([userId, setCode])
+  @@map("acquisition_batches")
+}
+model AcquisitionBatchItem {
+  cardName String? @map("card_name")
+  referenceUnitPrice Decimal? @map("reference_unit_price") @db.Decimal(14, 6)
+  referenceObservedOn DateTime? @map("reference_observed_on") @db.Date
+  referenceCapturedAt DateTime? @map("reference_captured_at")
+  purchaseAmount Decimal? @map("purchase_amount") @db.Decimal(12, 2)
+  costAmount Decimal? @map("cost_amount") @db.Decimal(12, 2)
+  costBasis String @default("paid") @map("cost_basis")
+  acquiredOn DateTime? @map("acquired_on") @db.Date
+  metadata Json @default("{}")
+  id String @id @default(uuid())
+  batchId String @map("batch_id")
+  collectionCardId String? @map("collection_card_id")
+  printingId String @map("printing_id")
+  quantity Int
+  isFoil Boolean @default(false) @map("is_foil")
+  batch AcquisitionBatch @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  collectionCard CollectionCard? @relation(fields: [collectionCardId], references: [id], onDelete: SetNull)
+  @@index([collectionCardId])
+  @@index([printingId])
+  @@unique([batchId, collectionCardId])
+  @@map("acquisition_batch_items")
+}
+model UserPreference {
+  userId String @id @map("user_id")
+  priceProvider String @default("cardmarket") @map("price_provider")
+  @@map("user_preferences")
+}
+model SetIndexMember {
+  setCode String @map("set_code")
+  printingId String @map("printing_id")
+  baselinePrice Float @map("baseline_price")
+  baselineDate DateTime @map("baseline_date") @db.Date
+  definitionVersion Int @default(1) @map("definition_version")
+  @@id([setCode, printingId, definitionVersion])
+  @@map("set_index_members")
+}
+model SetPriceIndex {
+  setCode String @map("set_code")
+  provider String @default("cardmarket")
+  capturedOn DateTime @map("captured_on") @db.Date
+  indexValue Float @map("index_value")
+  nCards Int @map("n_cards")
+  definitionVersion Int @default(1) @map("definition_version")
+  @@id([setCode, provider, capturedOn, definitionVersion])
+  @@map("set_price_index")
+}
+
+model DeckFunctionTargets {
+  deckId String @id @map("deck_id")
+  targets Json
+  @@map("deck_function_targets")
+}
+
+// Lists imported by a user into the market opportunities view.
+model ManualOpportunityCard {
+  id         Int      @id @default(autoincrement())
+  userId     String   @map("user_id")
+  sourceUrl  String   @map("source_url")
+  subject    String
+  cardName   String   @map("card_name")
+  setCode    String?  @map("set_code")
+  currency   String?
+  extra      Json
+  importedAt DateTime @default(now()) @map("imported_at") @db.Timestamptz(3)
+
+  @@index([userId, sourceUrl])
+  @@index([userId, importedAt])
+  @@map("manual_opportunity_cards")
+}
+
+model DeckAssignmentNotice {
+  id String @id @default(uuid())
+  userId String @map("user_id")
+  deckId String @map("deck_id")
+  cardName String @map("card_name")
+  deckName String @map("deck_name")
+  quantity Int
+  createdAt DateTime @default(now()) @map("created_at")
+  acceptedAt DateTime? @map("accepted_at")
+  deck Deck @relation(fields: [deckId], references: [id], onDelete: Cascade)
+
+  @@index([userId, acceptedAt])
+  @@map("deck_assignment_notices")
+}
+
+model AcquisitionQuote {
+  id String @id @default(uuid())
+  userId String @map("user_id")
+  mode String
+  payload Json
+  fingerprint String
+  createdAt DateTime @default(now()) @map("created_at")
+  consumedBatchId String? @map("consumed_batch_id")
+  batch AcquisitionBatch? @relation(fields: [consumedBatchId], references: [id], onDelete: SetNull)
+  @@index([userId])
+  @@map("acquisition_quotes")
+}

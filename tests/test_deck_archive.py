@@ -117,3 +117,12 @@ async def test_simulated_collection_service_excludes_archived_decks():
             where={"userId": "user-1", "isArchived": False},
             include={"cards": True},
         )
+
+
+@pytest.fixture(autouse=True)
+def empty_wants_for_priority_math():
+    from unittest.mock import patch, AsyncMock
+    from src.core.db import db
+    with patch.object(db, "wantcard") as wants:
+        wants.find_many = AsyncMock(return_value=[])
+        yield

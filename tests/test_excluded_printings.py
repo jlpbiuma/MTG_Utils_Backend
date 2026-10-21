@@ -97,6 +97,7 @@ async def test_cheapest_printings_orm_fallback_skips_art_series():
     p_playable.updatedAt = datetime.now()
 
     mock_db = MagicMock()
+    mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.query_raw = AsyncMock(side_effect=RuntimeError("sql unavailable"))
     mock_db.cardprinting.find_many = AsyncMock(return_value=[p_art, p_playable])
 
@@ -166,6 +167,7 @@ async def test_priority_never_selects_art_series_as_cheapest():
     p_playable.updatedAt = now
 
     mock_db = MagicMock()
+    mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.deck.find_many = AsyncMock(return_value=[deck])
     mock_db.collectioncard.find_many = AsyncMock(return_value=[])
     mock_db.cardprinting.find_many = AsyncMock(return_value=[p_art, p_playable])

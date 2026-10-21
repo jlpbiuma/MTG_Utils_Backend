@@ -117,16 +117,18 @@ async def enrich_card_name(name: str) -> bool:
                 }
             )
             if existing and existing.id != cc.id:
-                await db.collectioncard.update(
-                    where={"id": existing.id},
-                    data={
-                        "quantity": existing.quantity + cc.quantity,
-                        "imageUri": existing.imageUri or image_uri,
-                        "manaCost": existing.manaCost or mana_cost,
-                        "typeLine": existing.typeLine or type_line,
-                    },
-                )
-                await db.collectioncard.delete(where={"id": cc.id})
+                async with db.tx() as tx:
+                    await tx.query_raw("SELECT set_config('mtg.suppress_acquisition', 'on', true)")
+                    await tx.collectioncard.update(
+                        where={"id": existing.id},
+                        data={
+                            "quantity": existing.quantity + cc.quantity,
+                            "imageUri": existing.imageUri or image_uri,
+                            "manaCost": existing.manaCost or mana_cost,
+                            "typeLine": existing.typeLine or type_line,
+                        },
+                    )
+                    await tx.collectioncard.delete(where={"id": cc.id})
             else:
                 await db.collectioncard.update(
                     where={"id": cc.id},

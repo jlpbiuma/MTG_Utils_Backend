@@ -117,7 +117,7 @@ async def test_reality_fracture_commander_special_art_matches_index_and_detail_c
         cardprinting=SimpleNamespace(find_many=AsyncMock(return_value=printings)),
         collectioncard=SimpleNamespace(find_many=AsyncMock(return_value=[owned_row])),
         query_raw=AsyncMock(return_value=[{
-            "code": "rfc", "cardCount": 2, "ownedCount": 1,
+            "code": "rfc", "cardCount": 1, "ownedCount": 1, "alternativeVersionCount": 1,
             "totalValueEur": 12.0, "ownedValueEur": 7.0, "missingValueEur": 5.0,
         }]),
     )
@@ -129,20 +129,20 @@ async def test_reality_fracture_commander_special_art_matches_index_and_detail_c
     assert listing.status_code == detail.status_code == 200
     summary = listing.json()[0]
     detail_cards = detail.json()
-    detail_owned = sum(1 for card in detail_cards if card["isOwned"])
-    detail_total = len({card["id"] for card in detail_cards})
+    detail_owned = len({card["catalogId"] or card["id"] for card in detail_cards if card["isOwned"]})
+    detail_total = len({card["catalogId"] or card["id"] for card in detail_cards})
     detail_percentage = round(detail_owned * 100 / detail_total)
     assert (summary["ownedCount"], summary["cardCount"], summary["completionPercentage"]) == (
         detail_owned, detail_total, detail_percentage,
-    ) == (1, 2, 50)
+    ) == (1, 1, 100)
     base, special_art = detail_cards
     assert base["isOwned"] is True
     assert special_art["isOwned"] is False
     assert special_art["ownedElsewhere"] is True
     assert special_art["otherPrintings"] == [{"setCode": "RFC", "collectorNumber": "101", "quantity": 1}]
-    listing_sql = db.query_raw.call_args.args[0]
-    assert "lower(c.set_code) = lower(s.code)" in listing_sql
-    assert "lower(c.collector_number) = lower(p.collector_number)" in listing_sql
+    listing_sql = db.query_raw.call_args_list[0].args[0]
+    assert "lower(cs.code)=lower(c.set_code)" in listing_sql
+    assert "lower(p.collector_number)=lower(c.collector_number)" in listing_sql
 
 
 @pytest.mark.asyncio
@@ -229,10 +229,10 @@ async def test_catalog_sets_include_collection_completion_in_one_collection_quer
     assert response.json()[0]["missingValueEur"] == 7.5
     db.cardset.find_many.assert_awaited_once_with(take=2000, order={"releasedAt": "desc"})
     db.collectioncard.find_many.assert_awaited_once()
-    db.query_raw.assert_awaited_once()
-    expansion_query = db.query_raw.call_args.args[0]
+    assert db.query_raw.await_count == 2
+    expansion_query = db.query_raw.call_args_list[0].args[0]
     assert 'AS "missingValueEur"' in expansion_query
-    assert "lower(c.card_scryfall_id) = lower(p.id)" in expansion_query
+    assert "p.id=c.card_scryfall_id" in expansion_query
     assert "card_catalog" not in expansion_query
 
 
@@ -256,8 +256,10 @@ async def test_expansion_progress_uses_actual_printings_instead_of_stale_set_car
     assert expansion["cardCount"] == 140
     assert expansion["ownedCount"] == 85
     assert expansion["completionPercentage"] == 61
-    query = db.query_raw.call_args.args[0]
-    assert 'COUNT(DISTINCT p.id)::int AS "cardCount"' in query
+    query = db.query_raw.call_args_list[0].args[0]
+    assert 'GROUP BY p.set_id' in query
+    assert 'COALESCE(stats.total, 0)' in query
+    assert 'AS "cardCount"' in query
     assert 'AS "ownedCount"' in query
 
 

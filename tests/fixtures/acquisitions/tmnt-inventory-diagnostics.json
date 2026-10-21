@@ -1,0 +1,33 @@
+{
+  "source": "local-inventory-read-only",
+  "purchaseAssociationsChecked": false,
+  "lines": 93,
+  "copies": 100,
+  "problems": [
+    {
+      "line": 20,
+      "name": "Corpsejack Menace",
+      "errorCode": "name_not_owned"
+    },
+    {
+      "line": 24,
+      "name": "Double Jump/Flying Kick",
+      "errorCode": "printing_unresolved"
+    },
+    {
+      "line": 75,
+      "name": "Steelbane Hydra",
+      "errorCode": "name_not_owned"
+    },
+    {
+      "line": 91,
+      "name": "Vigor",
+      "errorCode": "name_not_owned"
+    },
+    {
+      "line": 92,
+      "name": "Voracious Hydra",
+      "errorCode": "name_not_owned"
+    }
+  ]
+}

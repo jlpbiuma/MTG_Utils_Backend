@@ -23,7 +23,7 @@ def printing(name, price, number='1', set_name='Example', foil=None):
 
 
 def database(printings=(), wants=()):
-    return NS(deck=NS(find_many=AsyncMock(return_value=[])),
+    return NS(query_raw=AsyncMock(return_value=[]), deck=NS(find_many=AsyncMock(return_value=[])),
               collectioncard=NS(find_many=AsyncMock(return_value=[])),
               cardprinting=NS(find_many=AsyncMock(return_value=list(printings))),
               wantcard=NS(find_many=AsyncMock(return_value=list(wants))),
@@ -115,6 +115,41 @@ def test_missing_price_exact_edition_foil_and_unfulfilled_wants():
     assert next(g for g in result.groups if g.key == 'extra_wants').quantity == 1
 
 
+def test_special_release_cart_uses_unique_collector_number_when_set_names_differ():
+    result = compare_purchase(
+        CartImport(entries=[CartEntry('Synthesizer Labship', 1, Decimal('1.25'), '17', 'Star-Trek-V3')]),
+        [printing('Synthesizer Labship', 2, number='17', set_name='Star Trek'),
+         printing('Synthesizer Labship', 2, number='18', set_name='Star Trek')],
+        [], {}, set(),
+    )
+    card = result.cards[0]
+    assert card.referenceKind == 'exact'
+    assert card.referencePrintingId == 'Synthesizer Labship-Star Trek-17'
+
+
+def test_special_release_cart_does_not_guess_when_collector_number_is_ambiguous():
+    result = compare_purchase(
+        CartImport(entries=[CartEntry('Synthesizer Labship', 1, Decimal('1.25'), '17', 'Star-Trek-V3')]),
+        [printing('Synthesizer Labship', 2, number='17', set_name='Star Trek'),
+         printing('Synthesizer Labship', 2, number='17', set_name='Star Trek Promo')],
+        [], {}, set(),
+    )
+    assert result.cards[0].referencePrintingId is None
+    assert result.cards[0].referenceKind == 'approximate'
+
+
+@pytest.mark.asyncio
+async def test_offer_selects_and_persists_a_default_printing_when_the_cart_has_no_exact_set():
+    raw = '1x Role Reversal\n#17\nNM\n1,25 €'
+    default = printing('Role Reversal', 2, number='17', set_name='Core Set')
+    db = database([default])
+    db.simulatedcollection.create.return_value = NS(id='offer')
+    with patch('src.services.simulated_collection_service.db', db):
+        analysis = await SimulatedCollectionService.create_simulated_collection('user-a', 'Oferta', None, raw, origin='cardmarket')
+    assert analysis.cards[0].selectedPrintingId == default.id
+    assert db.simulatedcard.create.await_args.kwargs['data']['selectedPrintingId'] == default.id
+
+
 def test_parser_whitespace_amounts_and_malformed_rows():
     cart = parse_cardmarket_cart('2x\tÉowyn, Fearless Knight (V.2)\n#430\nNM\n1.234,56 €\n1\n3x Missing Price\n#2\nNM\n0x Bad\n#3\n1,00 €')
     assert [(e.name, e.quantity, e.unit_price) for e in cart.entries] == [
@@ -137,7 +172,7 @@ async def test_saved_cart_preserves_source_and_recalculates_quotes():
     db.simulatedcollection.find_many.return_value = [saved]
     with patch('src.services.simulated_collection_service.db', db):
         created = await SimulatedCollectionService.create_simulated_collection('user-a', 'Carrito', None, raw)
-        db.simulatedcollection.create.assert_awaited_once_with(data={'userId': 'user-a', 'name': 'Carrito', 'description': None, 'rawText': raw})
+        db.simulatedcollection.create.assert_awaited_once_with(data={'userId': 'user-a', 'name': 'Carrito', 'description': None, 'rawText': raw, 'origin': 'other'})
         assert created.purchaseAnalysis.cards[0].marketUnitPrice == 1
         assert created.cards[0].acquiredAt is not None
         assert db.simulatedcard.create.call_args.kwargs['data']['acquiredAt'] is not None

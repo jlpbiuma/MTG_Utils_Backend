@@ -24,7 +24,7 @@ async def database():
     await admin.execute_raw(f'CREATE SCHEMA "{schema}"')
     client=Prisma(datasource={'url':URL+'?schema='+schema})
     try:
-        for table in ('user_collections','card_catalog'):
+        for table in ('user_collections','card_catalog','user_wants'):
             await admin.execute_raw(f'CREATE TABLE "{schema}".{table} (LIKE public.{table} INCLUDING ALL)')
         await client.connect()
         assert (await client.query_raw('SELECT current_schema() AS name'))[0]['name']==schema

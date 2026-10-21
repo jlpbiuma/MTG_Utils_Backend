@@ -37,6 +37,9 @@ async def test_simulated_collection_analysis_metrics():
     deck_1.name = "Deck Alpha"
     deck_1.userId = "user-123"
     deck_1.cards = [deck_card_1, deck_card_2]
+    for card in deck_1.cards:
+        card.deckId = deck_1.id
+        card.isSideboard = False
 
     deck_2_card = MagicMock()
     deck_2_card.id = "card-3"
@@ -53,6 +56,8 @@ async def test_simulated_collection_analysis_metrics():
     deck_2.name = "Deck Beta"
     deck_2.userId = "user-123"
     deck_2.cards = [deck_2_card]
+    deck_2_card.deckId = deck_2.id
+    deck_2_card.isSideboard = False
 
     # Real collection: user has 1 Sol Ring already in real collection
     real_col_card = MagicMock()
@@ -110,9 +115,8 @@ async def test_simulated_collection_analysis_metrics():
     # Sol Ring: Owned real = 1 -> ALREADY OWNED -> 0 useful copies, 2 surplus/sellable copies, 0 candidate decks
     # Forest: Basic land -> 0 useful copies, 1 surplus/sellable copy, 0 candidate decks
     # Arcane Signet: Owned real = 0, needed = 1 -> 1 useful copy, 0 surplus, 1 candidate deck
-    # Total non-basics = 3
-    # Total useful copies = 1 (Arcane Signet)
-    # Global net gain = (1 / 3) * 100 = 33.33%
+    # One new name completes half of Deck Alpha; Deck Beta gains nothing.
+    # Global net gain = (50 + 0) / 2 = 25%.
     # Economic value = (2 * 1.20) + (1 * 0.85) + (1 * 0.10) = 2.40 + 0.85 + 0.10 = 3.35 €
     raw_text = """
     2 Sol Ring
@@ -121,6 +125,7 @@ async def test_simulated_collection_analysis_metrics():
     """
 
     mock_db = MagicMock()
+    mock_db.query_raw = AsyncMock(return_value=[])
     mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.deck.find_many = AsyncMock(return_value=[deck_1, deck_2])
     mock_db.collectioncard.find_many = AsyncMock(return_value=[real_col_card])
@@ -144,7 +149,7 @@ async def test_simulated_collection_analysis_metrics():
         assert result.sellableCardsCount == 3 # 2 Sol Ring + 1 Forest
         assert result.usefulCardsCount == 1 # Only Arcane Signet
         assert result.alreadyOwnedCardsCount == 2 # 2 Sol Ring
-        assert result.globalNetGain == 33.33
+        assert result.globalNetGain == 25
         assert result.benefitedDecksCount == 1 # Only Deck Alpha benefited by Arcane Signet
 
         # Verify Sol Ring (already owned in real collection -> does NOT contribute to decks)
@@ -180,7 +185,7 @@ async def test_simulated_collection_analysis_metrics():
         assert signet_item.copiesNeededTotal == 1
         assert signet_item.usefulCopies == 1
         assert signet_item.surplusCopies == 0
-        assert signet_item.netCompletionGain == 33.33
+        assert signet_item.netCompletionGain == 25
         assert signet_item.candidateDeckCount == 1
         assert len(signet_item.candidateDecks) == 1
         assert signet_item.candidateDecks[0].deckId == "deck-1"
@@ -207,6 +212,7 @@ async def test_simulated_collection_persistence_and_deletion():
     created_coll.userId = "user-123"
 
     mock_db = MagicMock()
+    mock_db.query_raw = AsyncMock(return_value=[])
     mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.deck.find_many = AsyncMock(return_value=[deck])
     mock_db.collectioncard.find_many = AsyncMock(return_value=[])
@@ -270,6 +276,7 @@ async def test_cardprinting_without_manacost_attribute_does_not_raise_attribute_
     printing = StrictCardPrinting("bolt-id", 0.75, catalog)
 
     mock_db = MagicMock()
+    mock_db.query_raw = AsyncMock(return_value=[])
     mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.deck.find_many = AsyncMock(return_value=[])
     mock_db.collectioncard.find_many = AsyncMock(return_value=[])
@@ -322,6 +329,7 @@ async def test_simulated_collection_spanish_basics_and_owned_exclusion():
     owned_sol.quantity = 1
 
     mock_db = MagicMock()
+    mock_db.query_raw = AsyncMock(return_value=[])
     mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.deck.find_many = AsyncMock(return_value=[deck])
     mock_db.collectioncard.find_many = AsyncMock(return_value=[owned_sol])

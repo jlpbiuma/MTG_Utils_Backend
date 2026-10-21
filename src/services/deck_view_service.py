@@ -6,7 +6,7 @@ from src.core.db import db
 from src.schemas.deck import OtherDeckAssignment
 from src.schemas.deck_view import DeckViewCard, DeckViewResponse
 from src.schemas.pricing import PriceSummary
-from src.services.card_utils import normalize_card_name, is_basic_land, extract_colors_from_mana_cost
+from src.services.card_utils import normalize_card_name, is_basic_land, completion_counts, completion_owned, extract_colors_from_mana_cost
 from src.services.image_resolver import resolve_minio_image_uris, safe_image_uri
 from src.services.pricing_service import PricingService
 
@@ -84,18 +84,19 @@ class DeckViewService:
             collection_qty = owned_by_name.get(norm, 0)
             others = other_by_name.get(norm, [])
             basic = is_basic_land(card.typeLine, card.cardName)
-            effective_owned = card.quantity if basic else min(card.quantity, max(card.assignedQuantity or 0, min(collection_qty, card.quantity)))
-            missing = max(0, card.quantity - effective_owned)
-            if not card.isSideboard or getattr(card, "isCommander", False):
+            effective_owned = card.quantity if basic else min(card.quantity, max(card.assignedQuantity or 0, collection_qty))
+            missing = int(not card.isSideboard and not completion_owned(card, owned_by_name))
+            if not card.isSideboard:
                 total += card.quantity
                 owned += effective_owned
             quote = quotes.get(card.cardScryfallId) or quotes.get(norm)
             unit = quote.unitPrice.trend if quote else 0.0
             if quote:
                 visible_quotes[card.cardScryfallId or norm] = quote
-            total_value += unit * card.quantity
-            owned_value += unit * effective_owned
-            missing_value += unit * missing
+            if not card.isSideboard:
+                total_value += unit * card.quantity
+                owned_value += unit * effective_owned
+                missing_value += unit * (card.quantity - effective_owned)
             result.append(DeckViewCard(
                 id=card.id, deckId=card.deckId, cardScryfallId=card.cardScryfallId,
                 cardName=card.cardName, quantity=card.quantity,
@@ -106,6 +107,7 @@ class DeckViewService:
                 availableToAssign=max(0, collection_qty - sum(o.quantity for o in others) - card.assignedQuantity),
                 assignedInOtherDecks=others, missingCount=missing,
             ))
+        completion_total, owned = completion_counts(cards, owned_by_name)
         commander = next((c for c in cards if c.isCommander), None)
         commander_name = commander.cardName if commander else deck.commander
         identity = extract_colors_from_mana_cost(commander.manaCost) if commander else []
@@ -123,8 +125,8 @@ class DeckViewService:
                 "commanderScryfallId", "createdAt", "updatedAt"
             )},
             commanderImageUri=safe_image_uri(deck.commanderImageUri),
-            totalCards=total, uniqueCards=len(result), ownedCards=owned,
-            missingCards=max(0, total-owned), completionPercentage=round(owned / total * 100, 1) if total else 0,
+            totalCards=total, uniqueCards=completion_total, ownedCards=owned,
+            missingCards=max(0, completion_total-owned), completionPercentage=round(owned / completion_total * 100, 1) if completion_total else 0,
             cards=result,
             priceSummary=PriceSummary(
                 provider=provider, currency=currency, currencySymbol=symbol,

@@ -195,6 +195,8 @@ class EdhrecService:
         )
         decks_by_norm: Dict[str, Dict[str, DeckRequirement]] = {}
         for oc in user_deck_cards or []:
+            if getattr(oc, "isSideboard", False) is True or getattr(getattr(oc, "deck", None), "isArchived", False) is True:
+                continue
             norm = normalize_card_name(oc.cardName)
             deck_obj = getattr(oc, "deck", None)
             d_id = getattr(oc, "deckId", None) or (

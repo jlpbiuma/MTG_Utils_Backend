@@ -48,13 +48,14 @@ async def test_view_is_local_minimal_and_preserves_ownership(data):
                    card("Reserve", id="side", quantity=2, assignedQuantity=0, cardScryfallId="side", isSideboard=True)]
     view = await DeckViewService.get_view("d1", "u1")
     assert view.totalCards == 14  # Sideboard excluded, basic lands always owned.
-    assert view.ownedCards == 13
-    assert view.missingCards == 1
+    assert view.ownedCards == 2
+    assert view.missingCards == 0
+    assert view.completionPercentage == 100
     assert view.cards[0].ownedInCollection == 3
     assert view.cards[0].availableToAssign == 1
     assert view.cards[0].assignedInOtherDecks[0].deckId == "d2"
     assert view.cards[1].missingCount == 0
-    assert view.cards[2].missingCount == 2
+    assert view.cards[2].missingCount == 0
     assert view.priceSummary.totalNetValue == 8
     assert view.priceSummary.totalOwnedValue == 6
     assert view.priceSummary.totalMissingValue == 2

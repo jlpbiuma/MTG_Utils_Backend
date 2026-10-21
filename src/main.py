@@ -47,9 +47,13 @@ app.add_middleware(
 )
 
 
+from src.routers import purchases, performance, acquisitions
 from src.routers import decks, collection, scryfall, edhrec, pricing, import_cards, worker, auth, wants, catalog, priorities, simulated_collections, whatsapp_deals, cards
 
 # Include API Routers
+app.include_router(acquisitions.router, prefix="/api")
+app.include_router(performance.router, prefix="/api")
+app.include_router(purchases.router, prefix="/api")
 app.include_router(auth.router, prefix="/api")
 app.include_router(decks.router, prefix="/api")
 app.include_router(collection.router, prefix="/api")

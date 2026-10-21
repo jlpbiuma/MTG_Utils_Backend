@@ -76,6 +76,7 @@ async def test_whatsapp_deals_matching_flow(tmp_path):
     from unittest.mock import AsyncMock
 
     fake_db = SimpleNamespace(
+        deck=SimpleNamespace(find_many=AsyncMock(return_value=[])),
         wantcard=SimpleNamespace(find_many=AsyncMock(return_value=[want_mock])),
         collectioncard=SimpleNamespace(find_many=AsyncMock(return_value=[col_mock])),
         deckcard=SimpleNamespace(find_many=AsyncMock(return_value=[])),
@@ -83,6 +84,7 @@ async def test_whatsapp_deals_matching_flow(tmp_path):
     )
 
     with patch("src.services.whatsapp_deals_service.db", new=fake_db), \
+         patch("src.services.whatsapp_deals_service.read_saved_rows", return_value=[]), \
          patch("src.services.whatsapp_deals_service.WantService._deck_demand_by_name", return_value={}):
 
         response = await WhatsAppDealsService.get_matches("user-123", custom_db_path=db_file)
@@ -109,3 +111,19 @@ async def test_whatsapp_deals_matching_flow(tmp_path):
     assert col_match.matched_collection.available_quantity == 4
     assert "wa.me/34622222222" in col_match.direct_whatsapp_link
     assert "Lightning Bolt" in urllib.parse.unquote(col_match.direct_whatsapp_link)
+
+
+@pytest.mark.asyncio
+async def test_no_opportunities_still_reports_completion_for_active_decks():
+    from types import SimpleNamespace as NS
+    from unittest.mock import AsyncMock
+    from src.schemas.whatsapp_deals import WhatsAppMatchesResponse
+    cards = [NS(id="dc", deckId="a", cardName="Alpha", quantity=2, assignedQuantity=0, typeLine=None, isSideboard=False)]
+    database = NS(deck=NS(find_many=AsyncMock(return_value=[NS(id="a", cards=cards)])),
+                  collectioncard=NS(find_many=AsyncMock(return_value=[NS(cardName="Alpha", quantity=1)])))
+    with patch("src.services.whatsapp_deals_service.db", database), \
+         patch("src.services.whatsapp_deals_service.read_saved_rows", AsyncMock(return_value=[])), \
+         patch.object(WhatsAppDealsService, "_get_automatic_matches", AsyncMock(return_value=WhatsAppMatchesResponse())):
+        result = await WhatsAppDealsService.get_matches("user-1")
+    assert result.global_deck_count == 1 and result.global_completion_before == 100
+    database.deck.find_many.assert_awaited_once_with(where={"userId": "user-1", "isArchived": False}, include={"cards": True})

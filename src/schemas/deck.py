@@ -86,6 +86,8 @@ class DeckRequirement(BaseModel):
     isSideboard: bool = False
 
 class DeckCardWithOwnership(BaseModel):
+    oracleText: Optional[str] = None
+    producedMana: List[str] = Field(default_factory=list)
     id: str
     deckId: str
     cardScryfallId: str

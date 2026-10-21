@@ -66,6 +66,7 @@ async def test_priority_selects_cheapest_non_zero_reprint():
     p_cheapest.imageUriSmall = None
 
     mock_db = MagicMock()
+    mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.deck.find_many = AsyncMock(return_value=[deck])
     mock_db.collectioncard.find_many = AsyncMock(return_value=[])  # Not owned -> deficit = 1
     mock_db.cardprinting.find_many = AsyncMock(return_value=[p_zero, p_expensive, p_cheapest])
@@ -139,6 +140,7 @@ async def test_pricing_batch_prefers_exact_printing_when_priced():
     p_cheap.pricesUpdatedAt = datetime.now()
 
     mock_db = MagicMock()
+    mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.cardprinting.find_many = AsyncMock(side_effect=[
         [p_expensive],
         [p_expensive, p_cheap],
@@ -191,6 +193,7 @@ async def test_pricing_batch_falls_back_to_cheapest_when_exact_unpriced():
     p_cheap.pricesUpdatedAt = datetime.now()
 
     mock_db = MagicMock()
+    mock_db.wantcard.find_many = AsyncMock(return_value=[])
     mock_db.cardprinting.find_many = AsyncMock(side_effect=[
         [p_zero],
         [p_zero, p_cheap],

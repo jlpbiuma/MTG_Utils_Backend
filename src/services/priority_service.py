@@ -4,7 +4,7 @@ from src.core.db import db
 from src.services.card_utils import (
     normalize_card_name,
     is_basic_land,
-    completion_percentages_by_deck,
+    completion_percentages_by_deck, completion_cards, completion_counts, completion_owned,
     colors_by_deck,
     get_card_category,
 )
@@ -58,6 +58,8 @@ class PriorityService:
                 items=[],
             )
 
+        wants = await db.wantcard.find_many(where={"userId": user_id})
+        want_names = {normalize_card_name(w.cardName) for w in wants}
         col_cards = await db.collectioncard.find_many(where={"userId": user_id})
         col_map: Dict[str, int] = {}
         for c in col_cards:
@@ -71,23 +73,7 @@ class PriorityService:
         # Calculate deck stats (total cards, owned cards, missing cards)
         deck_stats: Dict[str, Dict[str, int]] = {}
         for d in user_decks:
-            total = 0
-            owned = 0
-            for c in (d.cards or []):
-                if c.isSideboard and not getattr(c, "isCommander", False):
-                    continue
-                qty = c.quantity or 0
-                if qty <= 0:
-                    continue
-                total += qty
-                norm = normalize_card_name(c.cardName)
-                if is_basic_land(c.typeLine, c.cardName):
-                    owned += qty
-                else:
-                    assigned = getattr(c, "assignedQuantity", 0) or 0
-                    in_col = col_map.get(norm, 0)
-                    actual_owned = min(qty, max(assigned, min(in_col, qty)))
-                    owned += actual_owned
+            total, owned = completion_counts(d.cards or [], col_map)
 
             missing = max(0, total - owned)
             comp = completions.get(d.id, round((owned / total) * 100, 1) if total else 0.0)
@@ -98,11 +84,6 @@ class PriorityService:
                 "completion": comp,
             }
 
-        total_non_basics_all_decks = sum(
-            sum(c.quantity for c in (d.cards or []) if not is_basic_land(c.typeLine, c.cardName))
-            for d in user_decks
-        )
-
         # Group by normalized card name
         grouped: Dict[str, Dict[str, Any]] = {}
         for d in user_decks:
@@ -112,7 +93,7 @@ class PriorityService:
             total_deck_cards = d_stat["totalCards"]
             missing_deck_cards = d_stat["missingCards"]
 
-            for c in (d.cards or []):
+            for c in completion_cards(d.cards or []):
                 if is_basic_land(c.typeLine, c.cardName):
                     continue
                 norm = normalize_card_name(c.cardName)
@@ -127,8 +108,7 @@ class PriorityService:
                     }
                 assigned = getattr(c, "assignedQuantity", 0) or 0
                 in_col = col_map.get(norm, 0)
-                actual_owned = min(c.quantity, max(assigned, min(in_col, c.quantity)))
-                missing = max(0, c.quantity - actual_owned)
+                missing = int(not completion_owned(c, col_map))
 
                 potential_gain = (
                     round((missing / total_deck_cards) * 100, 1)
@@ -210,7 +190,7 @@ class PriorityService:
             decks_info: List[PriorityDeckInfo] = g["decks"]
             copies_needed = sum(di.requestedQuantity for di in decks_info)
             copies_owned = col_map.get(norm, 0)
-            deficit = max(0, copies_needed - copies_owned)
+            deficit = int(copies_owned <= 0 and any(di.missingQuantity > 0 for di in decks_info))
 
             # Check reassign options
             reassign_opts: List[DeckReassignOption] = []
@@ -254,13 +234,14 @@ class PriorityService:
             avg_gain = round(sum(di.potentialGain for di in decks_info) / max(1, len(decks_info)), 1)
 
             # Net completion gain for ALL decks combined
-            net_gain = round((deficit / total_non_basics_all_decks) * 100, 2) if total_non_basics_all_decks > 0 else 0.0
+            net_gain = round(sum(di.potentialGain for di in decks_info) / len(user_decks), 2) if user_decks else 0.0
             sum_pts = round(sum(di.potentialGain for di in decks_info), 1)
 
             card_cat = get_card_category(g["typeLine"], g["cardName"])
 
             items.append(
                 PriorityItem(
+                    inWants=normalize_card_name(g["cardName"]) in want_names,
                     cardName=g["cardName"],
                     cardScryfallId=card_scryfall_id,
                     imageUri=g["imageUri"],
@@ -399,23 +380,7 @@ class PriorityService:
 
         deck_stats: Dict[str, Dict[str, Any]] = {}
         for d in user_decks:
-            total = 0
-            owned = 0
-            for c in (d.cards or []):
-                if c.isSideboard and not getattr(c, "isCommander", False):
-                    continue
-                qty = c.quantity or 0
-                if qty <= 0:
-                    continue
-                total += qty
-                norm = normalize_card_name(c.cardName)
-                if is_basic_land(c.typeLine, c.cardName):
-                    owned += qty
-                else:
-                    assigned = getattr(c, "assignedQuantity", 0) or 0
-                    in_col = col_map.get(norm, 0)
-                    actual_owned = min(qty, max(assigned, min(in_col, qty)))
-                    owned += actual_owned
+            total, owned = completion_counts(d.cards or [], col_map)
 
             missing = max(0, total - owned)
             comp = completions.get(d.id, round((owned / total) * 100, 1) if total else 0.0)
@@ -431,14 +396,13 @@ class PriorityService:
         grouped: Dict[str, Dict[str, Any]] = {}
         for d in user_decks:
             comp_pct = deck_stats[d.id]["completion"]
-            for c in (d.cards or []):
+            for c in completion_cards(d.cards or []):
                 if is_basic_land(c.typeLine, c.cardName):
                     continue
                 norm = normalize_card_name(c.cardName)
                 assigned = getattr(c, "assignedQuantity", 0) or 0
                 in_col = col_map.get(norm, 0)
-                actual_owned = min(c.quantity, max(assigned, min(in_col, c.quantity)))
-                missing = max(0, c.quantity - actual_owned)
+                missing = int(not completion_owned(c, col_map))
                 if missing <= 0:
                     continue
 
@@ -475,7 +439,7 @@ class PriorityService:
         candidate_norms = []
         for norm, g in list(grouped.items()):
             copies_owned = col_map.get(norm, 0)
-            deficit = max(0, g["totalNeeded"] - copies_owned)
+            deficit = int(copies_owned <= 0)
             if deficit <= 0:
                 del grouped[norm]
             else:

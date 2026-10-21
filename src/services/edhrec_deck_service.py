@@ -175,6 +175,8 @@ async def get_recommended_deck(slug: str, user_id: str):
     colors = colors_by_deck(deck_cards)
     requests, assignments = {}, {}
     for card in deck_cards:
+        if card.isSideboard or (card.deck and card.deck.isArchived):
+            continue
         norm = normalize_card_name(card.cardName)
         if norm not in pool:
             continue

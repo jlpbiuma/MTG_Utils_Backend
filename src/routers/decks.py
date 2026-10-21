@@ -1,3 +1,5 @@
+from src.schemas.deck_assignment import DeckAssignmentNoticeResponse
+from src.services.deck_assignment_service import DeckAssignmentService
 from fastapi import APIRouter, Depends, HTTPException, status
 from typing import List, Optional
 from src.core.auth import get_current_user_id
@@ -16,8 +18,8 @@ from src.services.deck_view_service import DeckViewService
 router = APIRouter(prefix="/decks", tags=["decks"])
 
 @router.get("", response_model=List[DeckSummaryResponse])
-async def list_decks(user_id: str = Depends(get_current_user_id)):
-    return await DeckService.get_user_decks(user_id)
+async def list_decks(provider: PriceProvider = "cardmarket", user_id: str = Depends(get_current_user_id)):
+    return await DeckService.get_user_decks(user_id, provider)
 
 @router.post("", response_model=DeckSummaryResponse, status_code=status.HTTP_201_CREATED)
 async def create_deck(data: DeckCreate, user_id: str = Depends(get_current_user_id)):
@@ -26,6 +28,18 @@ async def create_deck(data: DeckCreate, user_id: str = Depends(get_current_user_
 @router.get("/overlap")
 async def get_decks_overlap(user_id: str = Depends(get_current_user_id)):
     return await DeckService.get_decks_overlap(user_id)
+
+@router.get("/assignment-notices", response_model=List[DeckAssignmentNoticeResponse])
+async def assignment_notices(user_id: str = Depends(get_current_user_id)):
+    return await DeckAssignmentService.pending(user_id)
+
+
+@router.post("/assignment-notices/{notice_id}/accept")
+async def accept_assignment_notice(notice_id: str, user_id: str = Depends(get_current_user_id)):
+    if not await DeckAssignmentService.accept(user_id, notice_id):
+        raise HTTPException(status_code=404, detail="Aviso no encontrado")
+    return {"status": "success"}
+
 
 @router.get("/{deck_id}/view", response_model=DeckViewResponse)
 async def get_deck_view(
@@ -39,8 +53,8 @@ async def get_deck_view(
     return view
 
 @router.get("/{deck_id}", response_model=DeckDetailResponse)
-async def get_deck(deck_id: str, user_id: str = Depends(get_current_user_id)):
-    deck = await DeckService.get_deck_detail(deck_id, user_id)
+async def get_deck(deck_id: str, provider: PriceProvider = "cardmarket", user_id: str = Depends(get_current_user_id)):
+    deck = await DeckService.get_deck_detail(deck_id, user_id, provider)
     if not deck:
         raise HTTPException(status_code=404, detail="Mazo no encontrado")
     return deck

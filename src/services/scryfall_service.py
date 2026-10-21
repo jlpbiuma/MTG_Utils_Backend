@@ -1,4 +1,6 @@
 import httpx
+import asyncio
+from copy import deepcopy
 import logging
 import os
 import re
@@ -25,7 +27,7 @@ _SEARCH_TRANSLATE_FROM = "áéíóúüñàèìòùâêîôûäëïöüç''’"
 _SEARCH_TRANSLATE_TO = "aeiouunaeiouaeiouaeiouc"
 _CATALOG_SEARCH_SQL = f"""
 WITH searchable AS (
-    SELECT id, name, mana_cost, type_line, image_uri, set_code, collector_number,
+    SELECT id, name, name_es, mana_cost, type_line, image_uri, set_code, collector_number,
            regexp_replace(translate(lower(name), '{_SEARCH_TRANSLATE_FROM}', '{_SEARCH_TRANSLATE_TO}'),
                           '[^a-z0-9]+', '', 'g') AS search_name,
            regexp_replace(translate(lower(coalesce(name_es, '')), '{_SEARCH_TRANSLATE_FROM}', '{_SEARCH_TRANSLATE_TO}'),
@@ -51,7 +53,7 @@ WITH searchable AS (
           'me1', 'me2', 'me3', 'me4', 'vma', 'tpr', 'td0', 'td2', 'pz1', 'pz2', 'prm', 'pmoa', 'psdg', 'past'
       )
 )
-SELECT id, name, mana_cost, type_line, image_uri, set_code, collector_number
+SELECT id, name, name_es, mana_cost, type_line, image_uri, set_code, collector_number
 FROM searchable
 WHERE search_name LIKE '%' || $1 || '%' OR search_name_es LIKE '%' || $1 || '%'
 ORDER BY CASE
@@ -117,6 +119,14 @@ def _field(row: Any, *names: str) -> Any:
         if hasattr(row, name):
             return getattr(row, name)
     return None
+
+
+def _score_search_card(card: Dict[str, Any], query: str) -> int:
+    """Rank using either language while keeping the canonical English name."""
+    names = [card.get("name"), card.get("printed_name")]
+    for face in card.get("card_faces") or []:
+        names.extend([face.get("name"), face.get("printed_name")])
+    return min(score_card_match(name, query) for name in names)
 
 
 class ScryfallService:
@@ -214,6 +224,7 @@ class ScryfallService:
             results.append({
                 "id": record_id,
                 "name": _field(record, "name"),
+                "printed_name": _field(record, "name_es", "nameEs"),
                 "mana_cost": _field(record, "mana_cost", "manaCost"),
                 "type_line": _field(record, "type_line", "typeLine"),
                 "set": _field(record, "set_code", "setCode"),
@@ -230,9 +241,9 @@ class ScryfallService:
         # Database-first: hit the local CardCatalog cache before Scryfall.
         local_results = await ScryfallService.search_cards_local(query.strip())
         local_results = [c for c in local_results if is_playable_card(c)]
-        local_results.sort(key=lambda c: (score_card_match(c.get("name"), query), c.get("name") or ""))
+        local_results.sort(key=lambda c: (_score_search_card(c, query), c.get("name") or ""))
 
-        top_score = score_card_match(local_results[0].get("name"), query) if local_results else 99
+        top_score = _score_search_card(local_results[0], query) if local_results else 99
         # Return local directly if we have a top exact/word match
         # Interactive name searches can show partial local matches immediately.
         # Keep the default API behavior and Scryfall syntax searches unchanged.
@@ -249,6 +260,8 @@ class ScryfallService:
         async with httpx.AsyncClient(headers=SCRYFALL_HEADERS, timeout=10.0) as client:
             try:
                 scryfall_q = f"({query.strip()}) game:paper -is:digital -set_type:alchemy"
+                if plain_name:
+                    scryfall_q += " (lang:en OR lang:es)"
                 res = await client.get(f"{SCRYFALL_BASE}/cards/search", params={"q": scryfall_q, "page": page})
                 if res.status_code == 404:
                     return {"total_cards": len(local_results), "has_more": False, "data": local_results}
@@ -257,7 +270,7 @@ class ScryfallService:
                 clean_cards = [c for c in data.get("data", []) if is_playable_card(c)]
                 seen = {normalize_card_name(c["name"]) for c in clean_cards}
                 clean_cards.extend(c for c in local_results if normalize_card_name(c["name"]) not in seen)
-                clean_cards.sort(key=lambda c: (score_card_match(c.get("name"), query), c.get("name") or ""))
+                clean_cards.sort(key=lambda c: (_score_search_card(c, query), c.get("name") or ""))
                 return {
                     "total_cards": len(clean_cards) if len(clean_cards) != len(data.get("data", [])) else data.get("total_cards", 0),
                     "has_more": bool(data.get("has_more", False)),
@@ -291,7 +304,13 @@ class ScryfallService:
                 if res.status_code != 200:
                     return []
                 data = res.json()
-                return [name for name in data.get("data", []) if not name.startswith(("A-", "a-"))]
+                names = [name for name in data.get("data", []) if not name.startswith(("A-", "a-"))]
+                if names:
+                    return names
+                # Scryfall autocomplete only supplies canonical English names.
+                # Resolve localized prefixes through the bilingual search instead.
+                results = await ScryfallService.search_cards(query.strip(), prefer_local=True)
+                return list(dict.fromkeys(card["name"] for card in results["data"] if card.get("name")))[:10]
             except Exception as e:
                 logger.error(f"Error autocompleting cards: {e}")
                 return []
@@ -553,10 +572,12 @@ class ScryfallService:
             if card_id:
                 record = await db.cardcatalog.find_unique(where={"id": card_id})
                 if record is None:
-                    printing = await db.cardprinting.find_unique(where={"id": card_id})
+                    printing = await db.cardprinting.find_unique(where={"id": card_id}, include={"catalog": True})
                     catalog_id = getattr(printing, "catalogId", None) if printing else None
                     if catalog_id:
-                        record = await db.cardcatalog.find_unique(where={"id": catalog_id})
+                        record = getattr(printing, "catalog", None)
+                        if not isinstance(getattr(record, "detailsEs", None), dict):
+                            record = await db.cardcatalog.find_unique(where={"id": catalog_id})
             if record is None and name:
                 normalized_name = normalize_card_name(name)
                 if normalized_name:
@@ -565,7 +586,11 @@ class ScryfallService:
                     )
             details = getattr(record, "detailsEs", None) if record else None
             if isinstance(details, dict):
-                return details
+                result = deepcopy(details)
+                catalog_id = getattr(record, "id", None)
+                if isinstance(catalog_id, str):
+                    result["_catalog_id"] = catalog_id
+                return result
         except Exception as exc:
             # A cache failure must not prevent the live fallback.
             logger.warning("Unable to read card details cache: %s", exc)
@@ -624,6 +649,7 @@ class ScryfallService:
         Completes the stable Swift API contract on top of worker-produced
         localized details that do not expose a translation flag.
         """
+        details = deepcopy(details)
         details.setdefault("name_es", details.get("name", ""))
         details.setdefault("rarity_es", details.get("rarity", ""))
         details.setdefault("has_spanish_print", False)
@@ -648,7 +674,7 @@ class ScryfallService:
     ) -> Optional[str]:
         """
         Asks the worker to hydrate a missing card fully (Scryfall data,
-        images, prices and rulings) and blocks until it completes. Returns the
+        images, prices and rulings) and waits up to three seconds before the direct detail fallback. Returns the
         catalog id when the card was enriched, else None.
         """
         payload: Dict[str, str] = {}
@@ -659,8 +685,8 @@ class ScryfallService:
         if not payload:
             return None
         try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
-                res = await client.post(f"{WORKER_URL}/enrich-card", json=payload)
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                res = await asyncio.wait_for(client.post(f"{WORKER_URL}/enrich-card", json=payload), timeout=3.0)
                 if res.status_code == 200:
                     data = res.json()
                     if data.get("status") == "enriched":
