@@ -28,7 +28,7 @@ async def database(monkeypatch):
     try:
         await client.connect()
         baseline = (Path(__file__).parents[1] / 'prisma/migrations/0_init/migration.sql').read_text()
-        for table in ('decks', 'deck_cards', 'user_collections'):
+        for table in ('card_catalog', 'decks', 'deck_cards', 'user_collections', 'card_printings'):
             await client.execute_raw(re.search(r'CREATE TABLE "' + table + r'" \(.*?\);', baseline, re.S).group())
         await client.execute_raw('CREATE UNIQUE INDEX inventory_printing_finish ON user_collections(user_id,card_scryfall_id,is_foil)')
         await client.execute_raw('ALTER TABLE user_collections ADD COLUMN acquired_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP')

@@ -13,6 +13,7 @@ NON_PLAYABLE_LAYOUTS = {
 NON_PLAYABLE_SET_TYPES = {
     "memorabilia",
     "token",
+    "minigame",
 }
 
 NON_PLAYABLE_TYPES = {

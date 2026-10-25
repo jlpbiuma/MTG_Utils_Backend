@@ -69,6 +69,49 @@ async def test_cardmarket_acquisition_uses_imported_price_and_selected_print_whe
 
 
 @pytest.mark.asyncio
+async def test_offer_confirmation_resolves_default_art_automatically_from_history():
+    from src.services import acquisition_service
+    from src.schemas.acquisitions import OfferQuoteInput
+    card = SimulatedCardAnalysisItem(cardName='Role Reversal', quantity=1, selectedPrintingId=None, unitPrice=1.5, totalPrice=1.5)
+    purchase = PurchaseCard(cardName='Role Reversal', quantity=1, purchaseUnitPrice=1.5, referencePrintingId=None, historyPrintingId='role-rev-war')
+    analysis = SimulatedCollectionAnalysisResponse(id='offer-role', name='StarTrekV2', rawText='1 Role Reversal', origin='cardmarket', shipping=0,
+        cards=[card], purchaseAnalysis=PurchaseAnalysis(cards=[purchase]), status='evaluating')
+    database = NS(query_raw=AsyncMock(side_effect=[
+        [{'n': 0, 'base': '0', 'fee': '0'}],
+        [{'id': 'role-rev-war', 'code': 'war', 'collector_number': '214', 'image_uri': None, 'mana_cost': '{U}{U}{R}', 'type_line': 'Sorcery', 'price': 1.5, 'foil_price': None, 'observed_at': None}],
+    ]))
+    save = AsyncMock(side_effect=lambda user, mode, data: data)
+    with patch.object(acquisition_service, 'db', database), \
+         patch('src.services.simulated_collection_service.SimulatedCollectionService.get_simulated_collection', AsyncMock(return_value=analysis)), \
+         patch.object(acquisition_service, 'save_quote', save):
+        quote = await acquisition_service.create_offer_quote('owner', 'offer-role', OfferQuoteInput(acquiredOn=date(2026, 10, 21)))
+    assert quote['items'][0]['printingId'] == 'role-rev-war'
+    assert quote['items'][0]['purchaseUnitPrice'] == '1.5'
+
+
+@pytest.mark.asyncio
+async def test_offer_confirmation_resolves_default_art_from_catalog_when_all_ids_none():
+    from src.services import acquisition_service
+    from src.schemas.acquisitions import OfferQuoteInput
+    card = SimulatedCardAnalysisItem(cardName='Synthesizer Labship', quantity=1, selectedPrintingId=None, unitPrice=2.0, totalPrice=2.0)
+    purchase = PurchaseCard(cardName='Synthesizer Labship', quantity=1, purchaseUnitPrice=2.0, referencePrintingId=None, historyPrintingId=None)
+    analysis = SimulatedCollectionAnalysisResponse(id='offer-synth', name='StarTrekV3', rawText='1 Synthesizer Labship', origin='cardmarket', shipping=0,
+        cards=[card], purchaseAnalysis=PurchaseAnalysis(cards=[purchase]), status='evaluating')
+    database = NS(query_raw=AsyncMock(side_effect=[
+        [{'id': 'synth-default'}],  # resolve_card_default_printing_id query
+        [{'n': 0, 'base': '0', 'fee': '0'}],
+        [{'id': 'synth-default', 'code': 'stx', 'collector_number': '42', 'image_uri': None, 'mana_cost': '{3}', 'type_line': 'Artifact', 'price': 2.0, 'foil_price': None, 'observed_at': None}],
+    ]))
+    save = AsyncMock(side_effect=lambda user, mode, data: data)
+    with patch.object(acquisition_service, 'db', database), \
+         patch('src.services.simulated_collection_service.SimulatedCollectionService.get_simulated_collection', AsyncMock(return_value=analysis)), \
+         patch.object(acquisition_service, 'save_quote', save):
+        quote = await acquisition_service.create_offer_quote('owner', 'offer-synth', OfferQuoteInput(acquiredOn=date(2026, 10, 21)))
+    assert quote['items'][0]['printingId'] == 'synth-default'
+    assert quote['items'][0]['purchaseUnitPrice'] == '2.0'
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('selection',[None,['Alpha']])
 async def test_legacy_confirmation_uses_review_service_and_passes_budget_acknowledgement(selection):
     from src.services import acquisition_service

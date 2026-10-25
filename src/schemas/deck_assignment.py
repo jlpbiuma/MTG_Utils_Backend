@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional
 from pydantic import BaseModel
 
 
@@ -9,3 +10,4 @@ class DeckAssignmentNoticeResponse(BaseModel):
     deckName: str
     quantity: int
     createdAt: datetime
+    imageUri: Optional[str] = None

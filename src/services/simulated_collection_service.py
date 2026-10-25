@@ -231,25 +231,30 @@ class SimulatedCollectionService:
             all_printings = [p for p in all_printings if getattr(getattr(p, "set", None), "setType", None) not in ("art_series", "memorabilia") and not (isinstance(getattr(getattr(p, "set", None), "code", None), str) and len(p.set.code) == 4 and p.set.code.lower().startswith("a"))]
             for p in all_printings:
                 cat = getattr(p, "catalog", None)
-                norm = getattr(cat, "normalizedName", None) if cat else None
+                norm = normalize_card_name(cat.normalizedName) if (cat and isinstance(getattr(cat, "normalizedName", None), str)) else None
+                name_norm = normalize_card_name(cat.name) if (cat and isinstance(getattr(cat, "name", None), str)) else None
+                if not norm:
+                    norm = name_norm
                 if not norm:
                     continue
 
                 p_price = float(p.priceCardmarketTrend or p.priceEur or 0.0)
 
-                if norm not in fallback_printings:
-                    fallback_printings[norm] = p
+                for k in filter(None, {norm, name_norm}):
+                    if k not in fallback_printings:
+                        fallback_printings[k] = p
 
                 # Ignore non-positive prices to strictly adhere to cheapest non-zero print rule
                 if p_price <= 0.0:
                     continue
 
-                existing = cheapest_printings.get(norm)
-                if existing is None or p_price < existing["price"]:
-                    cheapest_printings[norm] = {
-                        "printing": p,
-                        "price": p_price,
-                    }
+                for k in filter(None, {norm, name_norm}):
+                    existing = cheapest_printings.get(k)
+                    if existing is None or p_price < existing["price"]:
+                        cheapest_printings[k] = {
+                            "printing": p,
+                            "price": p_price,
+                        }
 
         upcoming_reprints = context.reprints if context is not None else await upcoming_reprints_by_name([card["cardName"] for card in cards_input], all_printings, db)
 
@@ -257,10 +262,33 @@ class SimulatedCollectionService:
         selected_printings = {}
         for norm, printing_id in overrides.items():
             printing = next((p for p in all_printings if p.id == printing_id
-                             and normalize_card_name(getattr(p.catalog, "normalizedName", "")) == norm), None)
-            if norm not in sim_norms or printing is None:
+                             and (normalize_card_name(getattr(getattr(p, "catalog", None), "normalizedName", "")) == norm
+                                  or normalize_card_name(getattr(getattr(p, "catalog", None), "name", "")) == norm)), None)
+            if printing is None and printing_id:
+                try:
+                    p_db = await db.cardprinting.find_first(
+                        where={"id": printing_id},
+                        include={"catalog": True, "set": True},
+                    )
+                    if p_db:
+                        printing = p_db
+                        all_printings.append(p_db)
+                except Exception:
+                    pass
+            cat_norm = normalize_card_name(getattr(getattr(printing, "catalog", None), "normalizedName", "")) if printing else None
+            cat_name = normalize_card_name(getattr(getattr(printing, "catalog", None), "name", "")) if printing else None
+            matches_sim = norm in sim_norms or (cat_norm and cat_norm in sim_norms) or (cat_name and cat_name in sim_norms)
+            if not matches_sim or printing is None:
+                if context is not None:
+                    continue
                 raise HTTPException(status_code=422, detail="La versión no pertenece a esta carta o no está en el catálogo local.")
+            target_key = norm if norm in sim_norms else (cat_norm if cat_norm in sim_norms else (cat_name if cat_name in sim_norms else norm))
+            selected_printings[target_key] = printing
             selected_printings[norm] = printing
+            if cat_norm:
+                selected_printings[cat_norm] = printing
+            if cat_name:
+                selected_printings[cat_name] = printing
 
         # 5. Build analysis for each card
         analysis_cards: List[SimulatedCardAnalysisItem] = []
@@ -345,6 +373,31 @@ class SimulatedCollectionService:
                     set_code = meta["set_code"]
                 if not collector_number:
                     collector_number = meta["collector_number"]
+
+            if selected_printing is None and context is None:
+                try:
+                    fallback_p = await db.cardprinting.find_first(
+                        where={"OR": [
+                            {"catalog": {"normalizedName": norm}},
+                            {"catalog": {"name": {"equals": card_name, "mode": "insensitive"}}}
+                        ]},
+                        include={"catalog": True, "set": True},
+                        order={"priceCardmarketTrend": "asc"}
+                    )
+                    if fallback_p:
+                        selected_printing = fallback_p
+                        meta = _extract_printing_meta(fallback_p)
+                        scryfall_id = meta["scryfall_id"]
+                        mana_cost = meta["mana_cost"]
+                        type_line = meta["type_line"]
+                        image_uri = meta["image_uri"]
+                        if not set_code:
+                            set_code = meta["set_code"]
+                        if not collector_number:
+                            collector_number = meta["collector_number"]
+                        unit_price = max(0.0, float(fallback_p.priceCardmarketTrend or fallback_p.priceEur or 0.0))
+                except Exception:
+                    pass
 
 
             # Fallback metadata from deck cards if catalog had none

@@ -367,3 +367,24 @@ async def test_simulated_collection_spanish_basics_and_owned_exclusion():
         assert sol.netCompletionGain == 0.0
 
 
+@pytest.mark.asyncio
+async def test_simulated_collection_overrides_with_context_does_not_crash():
+    from src.services.simulated_collection_service import OfferAnalysisContext
+    mock_db = MagicMock()
+    mock_context = OfferAnalysisContext(
+        user_id="user-123",
+        user_data=([], [], []),
+        resolved_names={"solring": "Sol Ring"},
+        printings=[],
+        reprints={},
+    )
+    mock_db.cardprinting.find_first = AsyncMock(return_value=None)
+    with patch("src.services.simulated_collection_service.db", mock_db):
+        res = await SimulatedCollectionService.analyze_raw_text(
+            user_id="user-123",
+            raw_text="1 Sol Ring",
+            name="Test",
+            printing_overrides={"Nonexistent Card": "fake-printing-id"},
+            context=mock_context,
+        )
+    assert res.totalCards == 1

@@ -208,6 +208,37 @@ async def create_inventory_quote(user_id, payload):
                            acquiredOn=payload.acquiredOn.isoformat(),subtotal=str(total),shipping='0.00',fee='0.00',total=str(total),costBasis='trend',items=[item]))
 
 
+async def resolve_card_default_printing_id(card_name: str) -> str | None:
+    norm = normalize_card_name(card_name)
+    rows = await db.query_raw('''
+        SELECT p.id
+        FROM card_printings p
+        JOIN card_catalog cat ON cat.id=p.catalog_id
+        LEFT JOIN card_sets s ON s.id=p.set_id
+        WHERE (cat.normalized_name=$1 OR lower(cat.name)=lower($2))
+          AND COALESCE(s.set_type, '') NOT IN ('art_series', 'memorabilia')
+          AND NOT (length(COALESCE(s.code, '')) = 4 AND lower(COALESCE(s.code, '')) LIKE 'a%')
+        ORDER BY
+            CASE WHEN p.price_cardmarket_trend IS NOT NULL AND p.price_cardmarket_trend > 0 THEN 0
+                 WHEN p.price_eur IS NOT NULL AND p.price_eur > 0 THEN 1
+                 ELSE 2 END,
+            COALESCE(p.price_cardmarket_trend, p.price_eur, 999999) ASC,
+            p.id ASC
+        LIMIT 1
+    ''', norm, card_name)
+    if rows:
+        return rows[0]['id']
+    rows = await db.query_raw('''
+        SELECT p.id
+        FROM card_printings p
+        JOIN card_catalog cat ON cat.id=p.catalog_id
+        WHERE cat.normalized_name=$1 OR lower(cat.name)=lower($2)
+        ORDER BY COALESCE(p.price_cardmarket_trend, p.price_eur, 999999) ASC, p.id ASC
+        LIMIT 1
+    ''', norm, card_name)
+    return rows[0]['id'] if rows else None
+
+
 async def create_offer_quote(user_id, offer_id, payload):
     from src.services.simulated_collection_service import SimulatedCollectionService
     from src.services.offer_card_selection import remaining_offer_text
@@ -230,6 +261,7 @@ async def create_offer_quote(user_id, offer_id, payload):
         for c in chosen
         if c.selectedPrintingId
     }
+    analysis_card_map = {normalize_card_name(c.cardName): c for c in analysis.cards}
     items = []
     if analysis.origin == 'cardmarket':
         if not analysis.purchaseAnalysis:
@@ -240,21 +272,36 @@ async def create_offer_quote(user_id, offer_id, payload):
             price = payload.purchasePrices.get(str(n), c.purchaseUnitPrice)
             if price is None:
                 raise HTTPException(422, f'Introduce el precio pagado por {c.cardName}')
-            # Cardmarket's set slug/collector number may not be enough to
-            # reconstruct an exact printing (for example special products such
-            # as Star Trek). Preserve the exact printing already selected for
-            # the imported offer when the cart parser could not infer it.
-            printing_id = c.referencePrintingId or selected_printings.get(normalize_card_name(c.cardName))
+            norm_name = normalize_card_name(c.cardName)
+            printing_id = (
+                selected_printings.get(norm_name)
+                or c.referencePrintingId
+                or getattr(c, 'historyPrintingId', None)
+            )
             if not printing_id:
-                raise HTTPException(422, f'Selecciona la impresión exacta de {c.cardName}')
+                ac = analysis_card_map.get(norm_name)
+                if ac:
+                    printing_id = ac.selectedPrintingId or getattr(ac, 'cardScryfallId', None)
+            if not printing_id:
+                printing_id = await resolve_card_default_printing_id(c.cardName)
+            if not printing_id:
+                raise HTTPException(422, f'No se encontró ninguna versión en el catálogo para {c.cardName}')
             items.append(dict(cardName=c.cardName,printingId=printing_id,quantity=c.quantity,isFoil=c.isFoil,
                               referenceUnitPrice=str(c.marketUnitPrice) if c.referenceKind=='exact' and c.marketUnitPrice is not None else None,
                               purchaseUnitPrice=str(price),purchaseAmount=str(cents(Decimal(str(price))*c.quantity)),costAmount=str(cents(Decimal(str(price))*c.quantity))))
     else:
         for c in chosen:
-            if not c.selectedPrintingId:
-                raise HTTPException(422, f'Selecciona la impresión exacta de {c.cardName}')
-            items.append(dict(cardName=c.cardName,printingId=c.selectedPrintingId,quantity=c.quantity,isFoil=False,
+            norm_name = normalize_card_name(c.cardName)
+            printing_id = (
+                c.selectedPrintingId
+                or selected_printings.get(norm_name)
+                or getattr(c, 'cardScryfallId', None)
+            )
+            if not printing_id:
+                printing_id = await resolve_card_default_printing_id(c.cardName)
+            if not printing_id:
+                raise HTTPException(422, f'No se encontró ninguna versión en el catálogo para {c.cardName}')
+            items.append(dict(cardName=c.cardName,printingId=printing_id,quantity=c.quantity,isFoil=False,
                               referenceUnitPrice=str(c.unitPrice),costAmount=str(cents(Decimal(str(c.unitPrice))*c.quantity))))
     # A shared purchase key accounts for overhead only once across partial dumps.
     previous = await db.query_raw('SELECT COUNT(*)::int AS n,COALESCE(SUM(cost_total+shipping),0)::text AS base,COALESCE(SUM(fee),0)::text AS fee FROM acquisition_batches WHERE user_id=$1 AND purchase_key=$2',user_id,offer_id)

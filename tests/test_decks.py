@@ -762,3 +762,34 @@ async def test_add_missing_cards_to_collection_bulk():
         "SELECT set_config('mtg.preferred_deck', $1, true)", "deck-test"
     )
 
+
+@pytest.mark.asyncio
+async def test_deck_assignment_service_pending_resolves_image_and_filters_scryfall():
+    from src.services.deck_assignment_service import DeckAssignmentService
+    mock_db = MagicMock()
+    mock_db.query_raw = AsyncMock(return_value=[
+        {
+            "id": "notice-1",
+            "deckId": "deck-1",
+            "cardName": "Sol Ring",
+            "deckName": "Commander Deck",
+            "quantity": 1,
+            "createdAt": "2026-10-25T10:00:00Z",
+            "imageUri": "http://192.168.0.4:8088/images/token/rs:fill:672:936:0/minio.webp",
+        },
+        {
+            "id": "notice-2",
+            "deckId": "deck-2",
+            "cardName": "Arcane Signet",
+            "deckName": "Commander Deck 2",
+            "quantity": 1,
+            "createdAt": "2026-10-25T10:00:00Z",
+            "imageUri": "https://cards.scryfall.io/large/front/a/b/ab.jpg",
+        },
+    ])
+    with patch("src.services.deck_assignment_service.db", mock_db):
+        notices = await DeckAssignmentService.pending("user-123")
+
+    assert len(notices) == 2
+    assert notices[0]["imageUri"] == "http://192.168.0.4:8088/images/token/rs:fill:672:936:0/minio.webp"
+    assert notices[1]["imageUri"] is None

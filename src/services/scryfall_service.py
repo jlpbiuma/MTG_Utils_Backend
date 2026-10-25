@@ -198,6 +198,7 @@ class ScryfallService:
             printings = await db.cardprinting.find_many(
                 where={"catalogId": {"in": [_field(record, "id") for record in records if _field(record, "id")]}},
                 order={"releasedAt": "desc"},
+                include={"set": True},
             )
             for printing in printings:
                 printings_by_catalog.setdefault(printing.catalogId, printing)
@@ -221,14 +222,25 @@ class ScryfallService:
                     "large": large,
                     "art_crop": normal,
                 }
+            printing_set = getattr(printing, "set", None)
+            set_code = (
+                getattr(printing_set, "code", None)
+                if printing_set and isinstance(getattr(printing_set, "code", None), str)
+                else _field(record, "set_code", "setCode")
+            )
+            collector_num = (
+                getattr(printing, "collectorNumber", None)
+                if getattr(printing, "collectorNumber", None) and isinstance(getattr(printing, "collectorNumber", None), str)
+                else _field(record, "collector_number", "collectorNumber")
+            )
             results.append({
                 "id": record_id,
                 "name": _field(record, "name"),
                 "printed_name": _field(record, "name_es", "nameEs"),
                 "mana_cost": _field(record, "mana_cost", "manaCost"),
                 "type_line": _field(record, "type_line", "typeLine"),
-                "set": _field(record, "set_code", "setCode"),
-                "collector_number": _field(record, "collector_number", "collectorNumber"),
+                "set": set_code,
+                "collector_number": collector_num,
                 "image_uris": image_uris,
             })
         return results

@@ -34,8 +34,14 @@ def compare_purchase(cart: CartImport, printings: list[Any], wants: list[Any],
     by_name: dict[str, list[Any]] = defaultdict(list)
     for printing in printings:
         catalog = getattr(printing, "catalog", None)
-        if catalog and isinstance(catalog.normalizedName, str):
-            by_name[catalog.normalizedName].append(printing)
+        if catalog:
+            keys = set()
+            if isinstance(getattr(catalog, "normalizedName", None), str):
+                keys.add(normalize_card_name(catalog.normalizedName))
+            if isinstance(getattr(catalog, "name", None), str):
+                keys.add(normalize_card_name(catalog.name))
+            for key in keys:
+                by_name[key].append(printing)
     wanted: dict[str, int] = defaultdict(int)
     for want in wants:
         wanted[normalize_card_name(want.cardName)] += want.quantity
@@ -91,7 +97,7 @@ def compare_purchase(cart: CartImport, printings: list[Any], wants: list[Any],
                 sums[key]["comparedCost"] += entry.unit_price * quantity
                 sums[key]["comparedMarketValue"] += market * quantity
         resolved_identity = exact[0] if len(exact) == 1 else None
-        historical_printing = printing or resolved_identity
+        historical_printing = printing or resolved_identity or (candidates[0] if candidates else None)
         rows.append(PurchaseCard(
             historyPrintingId=historical_printing.id if historical_printing else None,
             referencePrintingId=resolved_identity.id if resolved_identity else None,

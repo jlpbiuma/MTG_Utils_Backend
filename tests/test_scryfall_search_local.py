@@ -174,3 +174,38 @@ async def test_partial_search_keeps_live_fallback_for_default_pagination_and_syn
          patch("src.services.scryfall_service.httpx.AsyncClient", client):
         await ScryfallService.search_cards(query, page, prefer_local=prefer_local)
     client.return_value.get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_search_cards_local_uses_latest_printing_set_and_collector_number():
+    mock_db = MagicMock()
+    # Catalog row still has older set 'cmm'
+    mock_db.query_raw = AsyncMock(return_value=[{
+        "id": "cat-archfiend",
+        "name": "Archfiend of Despair",
+        "mana_cost": "{6}{B}{B}",
+        "type_line": "Creature — Demon",
+        "image_uri": "https://img/cmm.png",
+        "set_code": "cmm",
+        "collector_number": "137",
+    }])
+    # Printings find_many returns the newer printing 'frc' first (releasedAt desc)
+    newer_printing = MagicMock(
+        catalogId="cat-archfiend",
+        imageUri="https://img/frc-46.webp",
+        imageUriSmall="https://img/frc-46-small.webp",
+        imageUriLarge="https://img/frc-46-large.webp",
+        set=MagicMock(code="frc"),
+        collectorNumber="46",
+    )
+    mock_db.cardprinting.find_many = AsyncMock(return_value=[newer_printing])
+
+    with patch("src.services.scryfall_service.db", mock_db):
+        results = await ScryfallService.search_cards_local("Archfiend")
+
+    assert len(results) == 1
+    assert results[0]["name"] == "Archfiend of Despair"
+    # Set and collector_number reflect the latest printing frc, not the stale cmm catalog row
+    assert results[0]["set"] == "frc"
+    assert results[0]["collector_number"] == "46"
+    assert results[0]["image_uris"]["normal"] == "https://img/frc-46.webp"
