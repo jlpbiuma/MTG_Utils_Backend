@@ -25,12 +25,11 @@ async def get_current_user_id(
     authorization: Optional[str] = Header(None),
 ) -> str:
     """
-    Resolves current user ID with priority:
-    1. Bearer token validated via AuthService (token cache or DB user); an
-       admin session (ADMIN_USER_EMAILS) may act as the user in X-User-Id
-    2. X-User-Id header
-    3. Direct UUID in Bearer token if no X-User-Id provided (for tests/direct API calls)
-    4. DEMO_USER_ID for local development
+    Resolves the current user from the session token (Authorization: Bearer).
+    X-User-Id only selects another user for an admin session (ADMIN_USER_EMAILS).
+    Without a valid session the request is rejected with 401, unless
+    ALLOW_INSECURE_DEV_AUTH is set for local development, which restores the
+    old fallbacks: X-User-Id, a bare user UUID as token, then DEMO_USER_ID.
     """
     bearer_token = _bearer(authorization)
     target_id = x_user_id.strip() if isinstance(x_user_id, str) and x_user_id.strip() else None
@@ -42,13 +41,18 @@ async def get_current_user_id(
                 return target_id
             return user.id
 
-    if target_id:
-        return target_id
+    if settings.ALLOW_INSECURE_DEV_AUTH:
+        if target_id:
+            return target_id
+        if bearer_token and len(bearer_token) == 36 and bearer_token.count("-") == 4:
+            return bearer_token
+        return settings.DEMO_USER_ID
 
-    if bearer_token and len(bearer_token) == 36 and bearer_token.count("-") == 4:
-        return bearer_token
-
-    return settings.DEMO_USER_ID
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Sesión no válida o caducada. Vuelve a iniciar sesión.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 async def require_admin(authorization: Optional[str] = Header(None)) -> UserInfo:

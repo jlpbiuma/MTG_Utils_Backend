@@ -42,8 +42,8 @@ async def get_me(
         if user:
             return user
 
-    # If X-User-Id is passed
-    if isinstance(x_user_id, str) and x_user_id.strip():
+    # Local development only (ALLOW_INSECURE_DEV_AUTH)
+    if settings.ALLOW_INSECURE_DEV_AUTH and isinstance(x_user_id, str) and x_user_id.strip():
         return UserInfo(
             id=x_user_id.strip(),
             email="user@magic.io",

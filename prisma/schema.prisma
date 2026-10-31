@@ -124,8 +124,24 @@ model User {
   passwordHash String   @map("password_hash")
   createdAt    DateTime @default(now()) @map("created_at")
   updatedAt    DateTime @updatedAt @map("updated_at")
+  sessions     UserSession[]
 
   @@map("users")
+}
+
+/// Login sessions. Only SHA-256 hashes of the tokens are stored, so the table
+/// cannot be used to impersonate anyone.
+model UserSession {
+  tokenHash        String   @id @map("token_hash")
+  refreshHash      String   @unique @map("refresh_hash")
+  userId           String   @map("user_id")
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt        DateTime @map("expires_at")
+  refreshExpiresAt DateTime @map("refresh_expires_at")
+  createdAt        DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@map("user_sessions")
 }
 
 model CardSet {

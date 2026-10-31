@@ -159,3 +159,91 @@ async def test_admin_powers_off_without_config(monkeypatch):
     admin = UserInfo(id="admin-id", email="admin-ia@mtg-utils.local", name="admin-ia", isAuthenticated=True)
     monkeypatch.setitem(auth_service._token_cache, "admin-token", (admin, 9e12))
     assert await get_current_user_id(x_user_id="target-id", authorization="Bearer admin-token") == "admin-id"
+
+
+@pytest.mark.asyncio
+async def test_production_rejects_requests_without_a_session(monkeypatch):
+    from fastapi import HTTPException
+    from src.core.config import settings
+    from src.core.auth import get_current_user_id
+
+    monkeypatch.setattr(settings, "ALLOW_INSECURE_DEV_AUTH", False)
+    for kwargs in (
+        {},
+        {"x_user_id": "11111111-2222-3333-4444-555555555555"},
+        {"authorization": "Bearer aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
+        {"authorization": "Bearer unknown-token", "x_user_id": "someone"},
+    ):
+        with patch("src.services.auth_service.db") as mock_db:
+            mock_db.usersession.find_unique = AsyncMock(return_value=None)
+            with pytest.raises(HTTPException) as exc:
+                await get_current_user_id(**{"x_user_id": None, "authorization": None, **kwargs})
+        assert exc.value.status_code == 401
+
+    # The public demo session keeps working.
+    assert await get_current_user_id(x_user_id=None, authorization="Bearer demo-access-token") == settings.DEMO_USER_ID
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        res = await ac.get("/api/decks", headers={"X-User-Id": "11111111-2222-3333-4444-555555555555"})
+        me = await ac.get("/api/auth/me", headers={"X-User-Id": "11111111-2222-3333-4444-555555555555"})
+    assert res.status_code == 401
+    assert me.json()["isAuthenticated"] is False
+
+
+@pytest.mark.asyncio
+async def test_sessions_are_persisted_hashed_and_survive_restart():
+    from types import SimpleNamespace
+    from datetime import datetime, timedelta, timezone
+    from src.services import auth_service
+    from src.services.auth_service import hash_password
+
+    db_user = SimpleNamespace(id="u-1", email="urza@magic.io", name="urza", passwordHash=hash_password("karn_golem_99"))
+    rows = {}
+
+    async def create(data):
+        rows[data["tokenHash"]] = SimpleNamespace(user=db_user, **data)
+        return rows[data["tokenHash"]]
+
+    async def find_unique(where, include=None):
+        if "tokenHash" in where:
+            return rows.get(where["tokenHash"])
+        return next((r for r in rows.values() if r.refreshHash == where["refreshHash"]), None)
+
+    async def delete(where):
+        return rows.pop(where["tokenHash"], None)
+
+    async def delete_many(where):
+        for key in [k for k, r in rows.items() if where.get("tokenHash") in (None, k) and "tokenHash" in where]:
+            rows.pop(key)
+
+    mock_db = AsyncMock()
+    mock_db.user.find_unique.return_value = db_user
+    mock_db.usersession.create.side_effect = create
+    mock_db.usersession.find_unique.side_effect = find_unique
+    mock_db.usersession.delete.side_effect = delete
+    mock_db.usersession.delete_many.side_effect = delete_many
+
+    with patch("src.services.auth_service.db", mock_db):
+        login = await AuthService.login("urza@magic.io", "karn_golem_99")
+        token, refresh = login.accessToken, login.refreshToken
+        # Only hashes are stored.
+        assert token not in rows and all(token not in str(vars(r)) for r in rows.values())
+
+        auth_service._token_cache.clear()  # API restart
+        assert (await AuthService.get_user_from_token(token)).id == "u-1"
+        # A user id is not a token.
+        assert await AuthService.get_user_from_token("u-1") is None
+
+        refreshed = await AuthService.refresh_session(refresh)
+        assert refreshed.user.id == "u-1" and refreshed.accessToken != token
+        auth_service._token_cache.clear()
+        assert await AuthService.get_user_from_token(token) is None  # rotated
+        assert (await AuthService.refresh_session(refresh)).error  # single use
+
+        next(iter(rows.values())).expiresAt = datetime.now(timezone.utc) - timedelta(seconds=1)
+        auth_service._token_cache.clear()
+        assert await AuthService.get_user_from_token(refreshed.accessToken) is None
+
+        await AuthService.logout(refreshed.accessToken)
+        assert rows == {}

@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     # Comma-separated emails allowed to act as any user (X-User-Id) with their
     # own session. Empty by default: set it only in local development.
     ADMIN_USER_EMAILS: str = os.getenv("ADMIN_USER_EMAILS", "")
+    # Local development only: accept X-User-Id / a bare user UUID without a
+    # session and fall back to the demo user. Never enable it in production.
+    ALLOW_INSECURE_DEV_AUTH: bool = os.getenv("ALLOW_INSECURE_DEV_AUTH", "false").lower() in ("1", "true", "yes")
 
     @property
     def admin_emails(self) -> set[str]:
