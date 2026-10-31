@@ -119,3 +119,43 @@ async def test_local_signup_and_login():
         assert login_fail.error == "Correo o contraseña incorrectos."
 
 
+
+
+@pytest.mark.asyncio
+async def test_admin_session_can_act_as_another_user(monkeypatch):
+    from src.core.config import settings
+    from src.services import auth_service
+
+    monkeypatch.setattr(settings, "ADMIN_USER_EMAILS", "admin-ia@mtg-utils.local")
+    admin = UserInfo(id="admin-id", email="admin-ia@mtg-utils.local", name="admin-ia", isAuthenticated=True)
+    other = UserInfo(id="other-id", email="someone@magic.io", name="someone", isAuthenticated=True)
+    monkeypatch.setitem(auth_service._token_cache, "admin-token", (admin, 9e12))
+    monkeypatch.setitem(auth_service._token_cache, "user-token", (other, 9e12))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        from src.core.auth import get_current_user_id
+        assert await get_current_user_id(x_user_id="target-id", authorization="Bearer admin-token") == "target-id"
+        # A regular session keeps its own id whatever X-User-Id says.
+        assert await get_current_user_id(x_user_id="target-id", authorization="Bearer user-token") == "other-id"
+
+        with patch("src.routers.admin.db") as mock_db:
+            mock_db.query_raw = AsyncMock(return_value=[{"id": "u1", "email": "a@b.c"}])
+            ok = await ac.get("/api/admin/users", headers={"Authorization": "Bearer admin-token"})
+            denied = await ac.get("/api/admin/users", headers={"Authorization": "Bearer user-token"})
+            anonymous = await ac.get("/api/admin/users", headers={"X-User-Id": "admin-id"})
+        assert ok.status_code == 200 and ok.json()[0]["id"] == "u1"
+        assert denied.status_code == 403
+        assert anonymous.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_powers_off_without_config(monkeypatch):
+    from src.core.config import settings
+    from src.core.auth import get_current_user_id
+    from src.services import auth_service
+
+    monkeypatch.setattr(settings, "ADMIN_USER_EMAILS", "")
+    admin = UserInfo(id="admin-id", email="admin-ia@mtg-utils.local", name="admin-ia", isAuthenticated=True)
+    monkeypatch.setitem(auth_service._token_cache, "admin-token", (admin, 9e12))
+    assert await get_current_user_id(x_user_id="target-id", authorization="Bearer admin-token") == "admin-id"

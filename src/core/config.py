@@ -16,6 +16,13 @@ class Settings(BaseSettings):
     OCR_API_URL: str = os.getenv("OCR_API_URL", "http://host.docker.internal:8020")
     OCR_API_TOKEN: str = os.getenv("OCR_API_TOKEN", "")
     OCR_API_TIMEOUT: float = float(os.getenv("OCR_API_TIMEOUT", "15"))
+    # Comma-separated emails allowed to act as any user (X-User-Id) with their
+    # own session. Empty by default: set it only in local development.
+    ADMIN_USER_EMAILS: str = os.getenv("ADMIN_USER_EMAILS", "")
+
+    @property
+    def admin_emails(self) -> set[str]:
+        return {e.strip().lower() for e in self.ADMIN_USER_EMAILS.split(",") if e.strip()}
 
     model_config = SettingsConfigDict(
         env_file=".env",
