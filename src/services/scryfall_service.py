@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from prisma import Json
 from typing import List, Dict, Any, Optional
 from src.core.db import db
-from src.services.card_utils import normalize_card_name, is_playable_card, is_catalog_record_playable
+from src.services.card_utils import normalize_card_name, is_playable_card, is_catalog_record_playable, card_mana_cost, card_face_stat
 from src.services.image_resolver import safe_image_uri, strip_scryfall_image_uris
 
 logger = logging.getLogger("mtg_backend.scryfall")
@@ -454,7 +454,7 @@ class ScryfallService:
                         "id": card_id,
                         "name": card_name,
                         "normalizedName": card_norm,
-                        "manaCost": card_data.get("mana_cost"),
+                        "manaCost": card_mana_cost(card_data),
                         "typeLine": card_data.get("type_line"),
                         "imageUri": image_uri,
                         "setCode": card_data.get("set"),
@@ -463,7 +463,7 @@ class ScryfallService:
                     "update": {
                         "name": card_name,
                         "normalizedName": card_norm,
-                        "manaCost": card_data.get("mana_cost"),
+                        "manaCost": card_mana_cost(card_data),
                         "typeLine": card_data.get("type_line"),
                         "imageUri": image_uri,
                     }
@@ -627,7 +627,7 @@ class ScryfallService:
                         "id": card_id,
                         "name": card_name,
                         "normalizedName": normalized_name,
-                        "manaCost": details.get("mana_cost"),
+                        "manaCost": card_mana_cost(details),
                         "typeLine": details.get("type_line"),
                         "oracleTextEs": details.get("oracle_text_es"),
                         "nameEs": details.get("name_es"),
@@ -640,7 +640,7 @@ class ScryfallService:
                         "detailsUpdatedAt": datetime.now(timezone.utc),
                     },
                     "update": {
-                        "manaCost": details.get("mana_cost"),
+                        "manaCost": card_mana_cost(details),
                         "typeLine": details.get("type_line"),
                         "oracleTextEs": details.get("oracle_text_es"),
                         "nameEs": details.get("name_es"),
@@ -922,7 +922,7 @@ class ScryfallService:
                 "id": card_data.get("id"),
                 "name": card_data.get("name"),
                 "name_es": name_es,
-                "mana_cost": card_data.get("mana_cost"),
+                "mana_cost": card_mana_cost(card_data),
                 "cmc": card_data.get("cmc"),
                 "type_line": card_data.get("type_line"),
                 "type_line_es": type_line_es,
@@ -930,10 +930,10 @@ class ScryfallService:
                 "oracle_text_es": oracle_text_es,
                 "flavor_text": card_data.get("flavor_text"),
                 "flavor_text_es": flavor_text_es,
-                "power": card_data.get("power"),
-                "toughness": card_data.get("toughness"),
-                "loyalty": card_data.get("loyalty"),
-                "defense": card_data.get("defense"),
+                "power": card_face_stat(card_data, "power"),
+                "toughness": card_face_stat(card_data, "toughness"),
+                "loyalty": card_face_stat(card_data, "loyalty"),
+                "defense": card_face_stat(card_data, "defense"),
                 "rarity": card_data.get("rarity"),
                 "rarity_es": rarity_es,
                 "set": card_data.get("set", "").upper(),

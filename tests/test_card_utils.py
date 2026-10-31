@@ -92,3 +92,22 @@ def test_combine_colors_from_mana_costs():
     assert combine_colors_from_mana_costs(["{W}{U}", "{B}"]) == ["W", "U", "B"]
     assert combine_colors_from_mana_costs(["{G}", None, "{R}"]) == ["R", "G"]
     assert combine_colors_from_mana_costs([]) == []
+
+
+def test_double_faced_rules_use_the_front_face():
+    from src.services.card_utils import card_face_stat, card_mana_cost, extract_cmc
+
+    assert get_card_category("Battle — Siege // Creature — Phyrexian Dinosaur") == "battles"
+    assert get_card_category("Land // Legendary Creature — Demon") == "lands"
+    assert get_card_category("Instant // Land") == "instants"
+    assert card_mana_cost({"card_faces": [{"mana_cost": "{X}{G}{G}"}, {"mana_cost": ""}]}) == "{X}{G}{G}"
+    assert card_face_stat({"card_faces": [{"defense": "6"}]}, "defense") == "6"
+    assert extract_cmc("{1}{R} // {1}{U}", "Instant // Instant") == 4
+    assert extract_cmc("{2}{R} // {1}{R}", "Creature — Giant // Instant — Adventure") == 3
+    assert extract_cmc("{2/W}{G/U/P}{HW}{X}") == 3.5
+
+
+def test_basic_land_names_must_match_exactly():
+    for name in ["Tropical Island", "Volcanic Island", "Mountain Goat", "Sapseep Forest", "Swamp Mosquito"]:
+        assert is_basic_land(None, name) is False
+    assert is_basic_land("Land — Forest Island", "Tropical Island") is False

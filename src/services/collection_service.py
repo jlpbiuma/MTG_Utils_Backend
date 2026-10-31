@@ -286,7 +286,7 @@ class CollectionService:
 
         def primary(item: CollectionCardResponse):
             if sort == "cmc":
-                return extract_cmc(item.manaCost)
+                return extract_cmc(item.manaCost, item.typeLine)
             if sort == "type":
                 return (item.typeLine or "").lower()
             if sort == "quantity":

@@ -157,7 +157,13 @@ async def get_card_details(
             "art_crop": normal,
         } if normal else {}
         for face in card.get("card_faces") or []:
-            face["image_uris"] = {}
+            # Only MinIO-mirrored back-face artwork survives; the front face
+            # follows the selected printing above.
+            face["image_uris"] = {
+                size: uri
+                for size, uri in (face.get("image_uris") or {}).items()
+                if safe_image_uri(uri)
+            }
 
         card["rulings"] = [
             {"date": ruling.rulingDate.isoformat(), "text": ruling.text, "source": ruling.source}

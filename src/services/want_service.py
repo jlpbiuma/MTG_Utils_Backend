@@ -215,7 +215,7 @@ class WantService:
 
         def primary(item: WantCardResponse):
             if sort == "cmc":
-                return extract_cmc(item.manaCost)
+                return extract_cmc(item.manaCost, item.typeLine)
             if sort == "type":
                 return (item.typeLine or "").lower()
             if sort == "quantity":

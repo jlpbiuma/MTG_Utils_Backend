@@ -1,3 +1,4 @@
+from functools import lru_cache
 from typing import Optional, Dict, Any, List
 import re
 
@@ -21,6 +22,11 @@ NON_PLAYABLE_TYPES = {
     "card // card",
 }
 
+_WHITESPACE_RE = re.compile(r"\s+")
+_FACE_SEPARATOR_RE = re.compile(r"\s*/+\s*")
+_MANA_SYMBOL_RE = re.compile(r"\{([^}]+)\}")
+
+
 def normalize_card_name(name: Optional[str]) -> str:
     """
     Normalizes a card name for edition-agnostic matching:
@@ -31,12 +37,53 @@ def normalize_card_name(name: Optional[str]) -> str:
     """
     if not name:
         return ""
-    cleaned = name.strip().lower()
-    cleaned = re.sub(r"\s+", " ", cleaned)
+    return _normalize_card_name(name)
+
+
+@lru_cache(maxsize=65536)
+def _normalize_card_name(name: str) -> str:
+    # Pure and called once per card row in every completion/demand pass.
+    cleaned = _WHITESPACE_RE.sub(" ", name.strip().lower())
     if "/" in cleaned:
-        cleaned = re.sub(r"\s*/+\s*", " // ", cleaned)
+        cleaned = _FACE_SEPARATOR_RE.sub(" // ", cleaned)
         cleaned = cleaned.split(" // ")[0]
     return cleaned
+
+
+def front_face(text: Optional[str]) -> str:
+    """Front half of a multi-face value such as "Battle — Siege // Creature"."""
+    if not text:
+        return ""
+    return text.split("//", 1)[0].strip()
+
+
+def card_mana_cost(card: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Mana cost to persist for a Scryfall card payload.
+
+    Split and adventure cards carry a combined top-level cost ("{1}{R} // {U}").
+    Transform, modal DFC, battle and reversible cards only carry it per face:
+    their mana value and colors on the stack are the front face's, so the front
+    face cost is persisted. The full per-face costs stay in ``card_faces``.
+    """
+    if not card:
+        return None
+    mana_cost = card.get("mana_cost")
+    if mana_cost:
+        return mana_cost
+    faces = card.get("card_faces") or []
+    front = faces[0] if faces and isinstance(faces[0], dict) else {}
+    return front.get("mana_cost") or mana_cost
+
+
+def card_face_stat(card: Optional[Dict[str, Any]], field: str) -> Any:
+    """Top-level stat (power, toughness, loyalty, defense) or the front face's."""
+    if not card:
+        return None
+    if card.get(field) is not None:
+        return card.get(field)
+    faces = card.get("card_faces") or []
+    return faces[0].get(field) if faces and isinstance(faces[0], dict) else None
 
 def is_art_card(card: Optional[Dict[str, Any]]) -> bool:
     """Returns True if the given Scryfall card payload represents an art card or memorabilia."""
@@ -163,22 +210,37 @@ def is_catalog_record_playable(record: Any) -> bool:
 
     return True
 
-def extract_cmc(mana_cost: Optional[str]) -> int:
+def _symbol_mana_value(symbol: str) -> float:
+    inner = symbol.strip().upper()
+    if inner in ("X", "Y", "Z"):
+        return 0
+    if inner.isdigit():
+        return int(inner)
+    if inner in ("½", "1/2") or (inner.startswith("H") and len(inner) > 1):
+        return 0.5
+    if "/" in inner:
+        # Hybrid symbols cost their most expensive half: {2/W} is 2, {W/U}
+        # and Phyrexian {W/P} / {G/U/P} are 1.
+        return max(int(part) if part.isdigit() else 1 for part in inner.split("/"))
+    return 1
+
+
+def extract_cmc(mana_cost: Optional[str], type_line: Optional[str] = None) -> float:
     """
-    Calculates Converted Mana Cost (CMC / Mana Value) from a mana string like
-    "{2}{U}{B}". Mirrors the frontend implementation.
+    Mana value from a mana string like "{2}{U}{B}". Mirrors the frontend.
+
+    A combined split cost ("{1}{R} // {1}{U}") adds both halves, as on
+    Scryfall. Adventure and Omen cards only count their main (front) half.
     """
     if not mana_cost:
         return 0
-    cmc = 0
-    for symbol in re.findall(r"\{([^}]+)\}", mana_cost):
-        inner = symbol.strip()
-        try:
-            cmc += int(inner)
-        except ValueError:
-            if inner not in ("X", "Y", "Z"):
-                cmc += 1
-    return cmc
+    halves = mana_cost.split("//")
+    if len(halves) > 1 and type_line:
+        lowered = type_line.lower()
+        if "adventure" in lowered or "aventura" in lowered or "omen" in lowered or "presagio" in lowered:
+            halves = halves[:1]
+    total = sum(_symbol_mana_value(symbol) for half in halves for symbol in _MANA_SYMBOL_RE.findall(half))
+    return int(total) if float(total).is_integer() else total
 
 def is_playable_card(card: Optional[Dict[str, Any]]) -> bool:
     """Returns True if the given Scryfall card payload is a real, playable paper MTG card."""
@@ -253,7 +315,7 @@ def extract_colors_from_mana_cost(mana_cost: Optional[str]) -> List[str]:
     if not mana_cost or not isinstance(mana_cost, str):
         return []
     found = set()
-    for symbol in re.findall(r"\{([^}]+)\}", mana_cost):
+    for symbol in _MANA_SYMBOL_RE.findall(mana_cost):
         upper = symbol.strip().upper()
         if upper in COLOR_ORDER:
             found.add(upper)
@@ -350,14 +412,9 @@ def is_basic_land(type_line: Optional[str] = None, card_name: Optional[str] = No
             or ("basica" in lower and "tierra" in lower)
         ):
             return True
-    if card_name:
-        norm = normalize_card_name(card_name)
-        if norm in BASIC_LAND_NAMES:
-            return True
-        for b in BASIC_LAND_NAMES:
-            if norm == b or norm.startswith(f"{b} ") or norm.endswith(f" {b}"):
-                return True
-    return False
+    # Exact names only: a prefix/suffix match made Tropical Island, Volcanic
+    # Island or Mountain Goat count as always-owned basic lands.
+    return bool(card_name) and normalize_card_name(card_name) in BASIC_LAND_NAMES
 
 
 def completion_cards(deck_cards: List[Any]) -> List[Any]:
@@ -402,10 +459,12 @@ def get_card_category(type_line: Optional[str] = None, card_name: Optional[str] 
     """
     Categorizes an MTG card based on its type_line, with intelligent fallback
     heuristics based on card name for basic and common lands when type_line is missing.
-    Follows MTG convention where creature types take precedence.
+    Follows MTG convention where creature types take precedence. Multi-face
+    cards are grouped by their front face, so a battle that transforms into a
+    creature stays a battle and an MDFC spell // land stays a spell.
     """
     if type_line:
-        lower = type_line.lower()
+        lower = front_face(type_line).lower()
         if "creature" in lower or "criatura" in lower:
             return "creatures"
         if "planeswalker" in lower:
