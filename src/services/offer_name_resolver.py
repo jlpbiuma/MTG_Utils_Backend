@@ -1,5 +1,6 @@
 """Resolve exact bilingual catalog names before comparing offers with user cards."""
 import json
+import time
 import logging
 import httpx
 from types import SimpleNamespace
@@ -67,7 +68,18 @@ async def _fetch_exact_spanish_card(name: str):
         return None
 
 
-async def resolve_offer_names(names: list[str], client) -> dict[str, str]:
+# Names Scryfall could not resolve, with the monotonic time they may be retried.
+# Process-local and only for misses: a found translation is persisted below.
+_REMOTE_MISS_TTL_SECONDS = 6 * 3600
+_remote_misses: dict[str, float] = {}
+
+
+async def resolve_offer_names(names: list[str], client, *, allow_remote: bool = True) -> dict[str, str]:
+    """Map folded offer names to canonical catalog names.
+
+    ``allow_remote=False`` keeps the lookup local, for listings that must not
+    wait on Scryfall; unresolved names are resolved when an offer is opened.
+    """
     keys = sorted({fold_search_text(name) for name in names if fold_search_text(name)})
     if not keys:
         return {}
@@ -85,10 +97,13 @@ async def resolve_offer_names(names: list[str], client) -> dict[str, str]:
     resolved = {key: next(iter(matches)) for key, matches in candidates.items() if len(matches) == 1}
     for name in dict.fromkeys(names):
         key = fold_search_text(name)
-        if not key or key in candidates or key in resolved:
+        if not key or key in candidates or key in resolved or not allow_remote:
+            continue
+        if _remote_misses.get(key, 0) > time.monotonic():
             continue
         card = await _fetch_exact_spanish_card(name)
         if card is None:
+            _remote_misses[key] = time.monotonic() + _REMOTE_MISS_TTL_SECONDS
             continue
         resolved[key] = card['name']
         printed_name = card.get('printed_name')

@@ -37,6 +37,41 @@ COLLECTION_SORT_FIELDS = (
     "requested_decks",
 )
 
+class _CollectionRow:
+    """Sort/filter view of an inventory row; builds its response on demand."""
+    __slots__ = ("card", "requestedInDecks", "cardName", "cardScryfallId", "quantity", "manaCost", "typeLine", "requestedInDecksCount")
+
+    def __init__(self, card: Any, requested: List[DeckRequirement]):
+        self.card = card
+        self.requestedInDecks = requested
+        self.requestedInDecksCount = len(requested)
+        self.cardName = card.cardName
+        self.cardScryfallId = card.cardScryfallId
+        self.quantity = card.quantity
+        self.manaCost = card.manaCost
+        self.typeLine = card.typeLine
+
+    def response(self, local_images: Dict[str, str]) -> CollectionCardResponse:
+        c = self.card
+        return CollectionCardResponse(
+            id=c.id,
+            userId=c.userId,
+            cardScryfallId=c.cardScryfallId,
+            cardName=c.cardName,
+            quantity=c.quantity,
+            isFoil=getattr(c, "isFoil", False),
+            setCode=c.setCode,
+            collectorNumber=c.collectorNumber,
+            manaCost=c.manaCost,
+            typeLine=c.typeLine,
+            imageUri=local_images.get(c.cardScryfallId) or safe_image_uri(c.imageUri),
+            updatedAt=c.updatedAt,
+            acquiredAt=getattr(c, "acquiredAt", None),
+            requestedInDecks=self.requestedInDecks,
+            requestedInDecksCount=self.requestedInDecksCount,
+        )
+
+
 class CollectionService:
     @staticmethod
     async def _deck_demand_by_name(
@@ -144,12 +179,18 @@ class CollectionService:
         price_provider: str = "cardmarket",
         page: int = 1,
         limit: Optional[int] = None,
+        min_price: Optional[float] = None,
+        max_price: Optional[float] = None,
     ) -> CollectionQueryResponse:
         """
-        Filters the WHOLE collection by name, then sorts and optionally groups
-        it into MTG type sections entirely on the backend, so the frontend never
-        performs these operations over a partial (paginated) card set.
-        Flat (non-grouped) responses can be page-sliced after sort.
+        Filters the WHOLE collection by name and price, then sorts and
+        optionally groups it into MTG type sections on the backend, so the
+        frontend never operates over a partial card set.
+
+        With ``limit`` every mode is paginated the same way: grouped pages are
+        consecutive slices of the section-ordered list, and section totals
+        always describe the whole filtered section. Only the requested page is
+        materialized (images and response models).
         """
         where_clause: Dict[str, Any] = {"userId": user_id}
         if query and query.strip():
@@ -159,43 +200,13 @@ class CollectionService:
             where=where_clause,
             order=[{"cardName": "asc"}, {"id": "asc"}],
         )
-
-        local_images, decks_by_norm = await asyncio.gather(
-            resolve_minio_image_uris([c.cardScryfallId for c in cards]),
-            CollectionService._deck_demand_by_name(
-                user_id, col_cards=cards if not (query and query.strip()) else None
-            ),
+        decks_by_norm = await CollectionService._deck_demand_by_name(
+            user_id, col_cards=cards if not (query and query.strip()) else None
         )
 
-        items: List[CollectionCardResponse] = []
-        for c in cards:
-            req_list = sorted(
-                list(decks_by_norm.get(normalize_card_name(c.cardName), {}).values()),
-                key=lambda r: r.deckName.lower(),
-            )
-            items.append(
-                CollectionCardResponse(
-                    id=c.id,
-                    userId=c.userId,
-                    cardScryfallId=c.cardScryfallId,
-                    cardName=c.cardName,
-                    quantity=c.quantity,
-                    isFoil=getattr(c, "isFoil", False),
-                    setCode=c.setCode,
-                    collectorNumber=c.collectorNumber,
-                    manaCost=c.manaCost,
-                    typeLine=c.typeLine,
-                    imageUri=local_images.get(c.cardScryfallId) or safe_image_uri(c.imageUri),
-                    updatedAt=c.updatedAt,
-                    acquiredAt=getattr(c, "acquiredAt", None),
-                    requestedInDecks=req_list,
-                    requestedInDecksCount=len(req_list),
-                )
-            )
-
-        normalized_query = (query or "").strip()
+        has_price_filter = min_price is not None or max_price is not None
         price_summary: Optional[Any] = None
-        if sort in ("price_trend", "price_subtotal") or grouped:
+        if sort in ("price_trend", "price_subtotal") or grouped or has_price_filter:
             price_summary = await PricingService.get_price_summary(
                 cards=[
                     {
@@ -212,54 +223,99 @@ class CollectionService:
                 bypass_cache=False,
             )
 
+        # Lightweight rows: the response model is only built for the page.
+        rows = [
+            _CollectionRow(c, sorted(decks_by_norm.get(normalize_card_name(c.cardName), {}).values(), key=lambda r: r.deckName.lower()))
+            for c in cards
+        ]
+        if has_price_filter:
+            rows = [row for row in rows if CollectionService._matches_price(row, price_summary, min_price, max_price)]
         if sort in COLLECTION_SORT_FIELDS:
-            items = CollectionService._sort_collection_cards(
-                items, sort, direction, price_summary
-            )
+            rows = CollectionService._sort_collection_cards(rows, sort, direction, price_summary)
 
-        unique_cards = len(items)
-        total_cards = sum(c.quantity for c in items)
-        currency_symbol = (
-            price_summary.currencySymbol if price_summary is not None else "€"
-        )
-        safe_page = max(1, page)
+        unique_cards = len(rows)
+        total_cards = sum(row.quantity for row in rows)
+        currency_symbol = price_summary.currencySymbol if price_summary is not None else "€"
         page_limit = limit if limit and limit > 0 else None
+        safe_page = max(1, page) if page_limit is not None else 1
 
-        if not grouped:
-            has_more = False
-            page_items = items
-            if page_limit is not None:
-                start = (safe_page - 1) * page_limit
-                end = start + page_limit
-                page_items = items[start:end]
-                has_more = end < unique_cards
-            return CollectionQueryResponse(
-                query=normalized_query,
-                grouped=False,
-                provider=price_provider,
-                currencySymbol=currency_symbol,
-                totalCards=total_cards,
-                uniqueCards=unique_cards,
-                page=safe_page,
-                limit=page_limit,
-                hasMore=has_more,
-                cards=page_items,
-            )
+        sections_meta: List[tuple] = []
+        if grouped:
+            # Section order first, then the requested sort inside each section.
+            buckets: Dict[str, List[_CollectionRow]] = {}
+            for row in rows:
+                buckets.setdefault(get_card_category(row.typeLine, row.cardName), []).append(row)
+            rows = []
+            for key, info in sorted(CARD_TYPE_GROUPS.items(), key=lambda item: item[1]["order"]):
+                if buckets.get(key):
+                    sections_meta.append((key, info, buckets[key]))
+                    rows.extend(buckets[key])
 
-        sections = CollectionService._group_collection_sections(
-            items, price_summary
-        )
-        return CollectionQueryResponse(
-            query=normalized_query,
-            grouped=True,
+        start = (safe_page - 1) * page_limit if page_limit is not None else 0
+        end = start + page_limit if page_limit is not None else unique_cards
+        page_rows = rows[start:end]
+        local_images = await resolve_minio_image_uris([row.cardScryfallId for row in page_rows])
+        responses = {id(row): row.response(local_images) for row in page_rows}
+
+        result = CollectionQueryResponse(
+            query=(query or "").strip(),
+            grouped=grouped,
             provider=price_provider,
             currencySymbol=currency_symbol,
             totalCards=total_cards,
             uniqueCards=unique_cards,
-            page=1,
-            limit=None,
-            hasMore=False,
-            sections=sections,
+            page=safe_page,
+            limit=page_limit,
+            hasMore=end < unique_cards,
+        )
+        if not grouped:
+            result.cards = [responses[id(row)] for row in page_rows]
+            return result
+        result.sections = [
+            CollectionService._section(key, info, section_rows, price_summary, currency_symbol,
+                                       [responses[id(row)] for row in section_rows if id(row) in responses])
+            for key, info, section_rows in sections_meta
+        ]
+        if page_limit is not None:
+            result.sections = [section for section in result.sections if section.cards]
+        return result
+
+    @staticmethod
+    def _matches_price(item: Any, price_summary: Optional[Any], min_price: Optional[float], max_price: Optional[float]) -> bool:
+        """Mirrors the web ``matchesPriceFilter``: unpriced cards never match."""
+        quote = CollectionService._quote_for(item, price_summary)
+        price = None
+        if quote is not None:
+            price = quote.unitPrice.trend if quote.unitPrice.trend is not None else quote.subtotal
+        if price is None:
+            return False
+        if min_price is not None and price < min_price:
+            return False
+        if max_price is not None and price > max_price:
+            return False
+        return True
+
+    @staticmethod
+    def _section(key, info, rows, price_summary, currency_symbol, page_cards) -> CollectionGroupSection:
+        total_cards = sum(row.quantity for row in rows)
+        section_total_price = 0.0
+        for row in rows:
+            quote = CollectionService._quote_for(row, price_summary)
+            section_total_price += (quote.unitPrice.trend if quote else 0.0) * row.quantity
+        return CollectionGroupSection(
+            key=key,
+            label=info["label"],
+            order=info["order"],
+            totalCards=total_cards,
+            uniqueCards=len(rows),
+            ownedCards=total_cards,
+            missingCards=0,
+            completionPercentage=100.0,
+            sectionTotalPrice=round(section_total_price, 2),
+            sectionMissingPrice=0.0,
+            sectionOwnedPrice=round(section_total_price, 2),
+            currencySymbol=currency_symbol,
+            cards=page_cards,
         )
 
     @staticmethod
@@ -276,11 +332,11 @@ class CollectionService:
 
     @staticmethod
     def _sort_collection_cards(
-        items: List[CollectionCardResponse],
+        items: List[Any],
         sort: str,
         direction: str,
         price_summary: Optional[Any],
-    ) -> List[CollectionCardResponse]:
+    ) -> List[Any]:
         """Sorts the full collection server-side, mirroring the frontend sortCards."""
         multiplier = -1 if direction == "desc" else 1
 
@@ -311,53 +367,6 @@ class CollectionService:
             return 1 if tiebreak(a) > tiebreak(b) else (-1 if tiebreak(a) < tiebreak(b) else 0)
 
         return sorted(items, key=functools.cmp_to_key(compare))
-
-    @staticmethod
-    def _group_collection_sections(
-        items: List[CollectionCardResponse],
-        price_summary: Optional[Any],
-    ) -> List[CollectionGroupSection]:
-        """Groups the filtered/sorted collection into MTG type sections with stats."""
-        buckets: Dict[str, List[CollectionCardResponse]] = {}
-        for item in items:
-            cat = get_card_category(item.typeLine, item.cardName)
-            buckets.setdefault(cat, []).append(item)
-
-        currency_symbol = (
-            price_summary.currencySymbol if price_summary is not None else "€"
-        )
-        sections: List[CollectionGroupSection] = []
-        for key, group_info in CARD_TYPE_GROUPS.items():
-            cat_cards = buckets.get(key)
-            if not cat_cards:
-                continue
-
-            total_cards = sum(c.quantity for c in cat_cards)
-            unique = len(cat_cards)
-            section_total_price = 0.0
-            for c in cat_cards:
-                quote = CollectionService._quote_for(c, price_summary)
-                trend = quote.unitPrice.trend if quote else 0.0
-                section_total_price += trend * c.quantity
-
-            sections.append(CollectionGroupSection(
-                key=key,
-                label=group_info["label"],
-                order=group_info["order"],
-                totalCards=total_cards,
-                uniqueCards=unique,
-                ownedCards=total_cards,
-                missingCards=0,
-                completionPercentage=100.0,
-                sectionTotalPrice=round(section_total_price, 2),
-                sectionMissingPrice=0.0,
-                sectionOwnedPrice=round(section_total_price, 2),
-                currencySymbol=currency_symbol,
-                cards=cat_cards,
-            ))
-
-        sections.sort(key=lambda s: s.order)
-        return sections
 
     @staticmethod
     async def add_or_increment_card(
@@ -630,12 +639,30 @@ class CollectionService:
         return await import_text(db, user_id, raw_text, request_key)
 
     @staticmethod
+    async def _edhrec_recommended_norms(commanders: List[str]) -> set:
+        """Normalized names EDHREC recommends for any of these commanders."""
+        norms = sorted({normalize_card_name(name) for name in commanders if name})
+        if not norms:
+            return set()
+        rows = await db.edhreccommander.find_many(
+            where={"normalizedName": {"in": norms}, "status": "synced"},
+        )
+        recommended: set = set()
+        for row in rows:
+            lists = row.cardsJson if isinstance(row.cardsJson, dict) else {}
+            for cards in lists.values():
+                for card in cards if isinstance(cards, list) else []:
+                    name = card.get("normalizedName") or card.get("name") if isinstance(card, dict) else None
+                    if name:
+                        recommended.add(normalize_card_name(name))
+        return recommended
+
+    @staticmethod
     async def get_dormant_cards(
         user_id: str,
         min_price: float = 0.0,
         provider: str = "cardmarket",
     ) -> DormantCardsResponse:
-        from src.services.edhrec_service import EdhrecService
         from src.services.card_utils import is_basic_land
         from src.services.pricing_service import PRICE_PROVIDERS
 
@@ -652,17 +679,11 @@ class CollectionService:
             for c in (d.cards or []):
                 deck_card_norms.add(normalize_card_name(c.cardName))
 
-        edhrec_norms: set = set()
-        for cmd in active_commanders:
-            try:
-                data = await EdhrecService.fetch_edhrec_data(cmd)
-                if data and "cardlists" in data:
-                    for cl in data["cardlists"]:
-                        for cr in cl.get("cardviews", []):
-                            if cr.get("name"):
-                                edhrec_norms.add(normalize_card_name(cr["name"]))
-            except Exception as e:
-                logger.warning(f"Error fetching EDHREC recommendations for commander {cmd}: {e}")
+        # EDHREC lists come from the worker-synced table: one local query
+        # instead of one sequential download per commander on every request.
+        # (The previous lookup read a "cardlists" key that the parsed EDHREC
+        # payload never has, so recommendations were never excluded.)
+        edhrec_norms = await CollectionService._edhrec_recommended_norms(active_commanders)
 
         col_cards = await db.collectioncard.find_many(where={"userId": user_id})
         candidate_cards = []

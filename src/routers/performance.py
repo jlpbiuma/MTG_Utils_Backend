@@ -39,12 +39,18 @@ async def performance(code: str, user_id: str = Depends(get_current_user_id)):
             AND h.finish=CASE WHEN i.is_foil THEN 1 ELSE 0 END AND h.date<=$2::date ORDER BY date DESC LIMIT 1) baseline ON true)
           SELECT day::text AS date,SUM(price_cents*quantity)::float/NULLIF(SUM(base*quantity),0)*100 AS value
           FROM valuations GROUP BY day HAVING COUNT(price_cents)=COUNT(*) AND COUNT(base)=COUNT(*) ORDER BY day''', lot['id'], lot['acquiredOn'])
-    owned_series = await db.query_raw("""WITH holdings AS (
-      SELECT resolved.id, c.is_foil, SUM(c.quantity)::int AS quantity FROM user_collections c
-      JOIN LATERAL (SELECT p.id FROM card_printings p JOIN card_sets s ON s.id=p.set_id
-        WHERE s.code=lower($2) AND (p.id=c.card_scryfall_id OR (lower(c.set_code)=s.code AND lower(c.collector_number)=lower(p.collector_number)))
-        ORDER BY (p.id=c.card_scryfall_id) DESC LIMIT 1) resolved ON true
-      WHERE c.user_id=$1 GROUP BY resolved.id,c.is_foil),
+    # Inventory rows resolve to this set's printing by exact id first, then by
+    # set code + collector number. Joining the set's printings once by id and
+    # by number avoids scanning every printing for every inventory row.
+    owned_series = await db.query_raw("""WITH set_printings AS (
+      SELECT p.id, lower(p.collector_number) AS number FROM card_printings p JOIN card_sets s ON s.id=p.set_id WHERE s.code=lower($2)),
+      resolved AS (
+      SELECT COALESCE(exact.id, fallback.id) AS id, c.is_foil, c.quantity FROM user_collections c
+      LEFT JOIN set_printings exact ON exact.id=c.card_scryfall_id
+      LEFT JOIN LATERAL (SELECT sp.id FROM set_printings sp WHERE exact.id IS NULL AND sp.number=lower(c.collector_number)
+        ORDER BY sp.id LIMIT 1) fallback ON true
+      WHERE c.user_id=$1 AND (exact.id IS NOT NULL OR lower(c.set_code)=lower($2))),
+      holdings AS (SELECT id, is_foil, SUM(quantity)::int AS quantity FROM resolved WHERE id IS NOT NULL GROUP BY id,is_foil),
       dates AS (SELECT DISTINCT date_trunc('week',h.date)::date+6 AS day FROM holdings i JOIN cm_price_history h ON h.scryfall_id=i.id AND h.finish=CASE WHEN i.is_foil THEN 1 ELSE 0 END),
       values_by_day AS (SELECT LEAST(d.day,CURRENT_DATE) AS day,i.quantity,h.price_cents FROM dates d CROSS JOIN holdings i
         LEFT JOIN LATERAL (SELECT price_cents FROM cm_price_history WHERE scryfall_id=i.id AND finish=CASE WHEN i.is_foil THEN 1 ELSE 0 END

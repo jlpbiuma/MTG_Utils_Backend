@@ -40,11 +40,14 @@ async def get_collection_query(
     priceProvider: str = Query("cardmarket"),
     page: int = Query(1, ge=1),
     limit: Optional[int] = Query(None, ge=1, le=500),
+    minPrice: Optional[float] = Query(None, ge=0),
+    maxPrice: Optional[float] = Query(None, ge=0),
     user_id: str = Depends(get_current_user_id)
 ):
     """
-    Returns the collection filtered, sorted and optionally grouped into MTG type
-    sections on the backend. Flat lists accept page/limit slicing.
+    Returns the collection filtered by name and price, sorted and optionally
+    grouped into MTG type sections on the backend. ``limit`` paginates flat and
+    grouped results alike; totals always describe the whole filtered set.
     """
     return await CollectionService.get_user_collection_query(
         user_id,
@@ -55,6 +58,8 @@ async def get_collection_query(
         price_provider=priceProvider,
         page=page,
         limit=limit,
+        min_price=minPrice,
+        max_price=maxPrice,
     )
 
 @router.post("/add-or-increment", response_model=CollectionCardResponse)

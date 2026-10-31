@@ -1,10 +1,21 @@
 """Project opportunity purchases with the same ownership rules as deck completion."""
 from collections import defaultdict
+from typing import NamedTuple
 from src.schemas.whatsapp_deals import OpportunityDeckImpact
 from src.services.card_utils import normalize_card_name, is_basic_land, completion_percentages_by_deck, completion_cards, completion_owned
 
 
-def enrich_completion(matches, decks, deck_cards, collection):
+class CompletionBaseline(NamedTuple):
+    """Completion state before any purchase; depends only on the user's data."""
+    count: int
+    before: float
+    before_by_deck: dict
+    totals: dict
+    owned_totals: dict
+    requirements: dict
+
+
+def completion_baseline(decks, deck_cards, collection) -> CompletionBaseline:
     owned = defaultdict(int)
     for card in collection:
         owned[normalize_card_name(card.cardName)] += card.quantity
@@ -34,10 +45,17 @@ def enrich_completion(matches, decks, deck_cards, collection):
             total_cards=totals[card.deckId], owned_cards=owned_totals[card.deckId],
             quantity=1, assigned_quantity=int(assigned > 0), collection_quantity=int(owned[norm] > 0),
         ))
+    return CompletionBaseline(count, before, before_by_deck, totals, owned_totals, requirements)
+
+
+def enrich_completion(matches, decks, deck_cards, collection, baseline: CompletionBaseline | None = None):
+    """Projects each sale match onto deck completion; reuse ``baseline`` across offers."""
+    count, before, before_by_deck, totals, owned_totals, requirements = (
+        baseline or completion_baseline(decks, deck_cards, collection))
     for match in matches:
         if match.subject != "vende":
             continue
-        match.completion_requirements = requirements.get(match.normalized_name, [])
+        match.completion_requirements = list(requirements.get(match.normalized_name, []))
         projected_owned = defaultdict(int)
         for impact in match.completion_requirements:
             old = int(impact.assigned_quantity > 0 or impact.collection_quantity > 0)

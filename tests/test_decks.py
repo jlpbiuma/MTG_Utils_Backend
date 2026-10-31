@@ -793,3 +793,18 @@ async def test_deck_assignment_service_pending_resolves_image_and_filters_scryfa
     assert len(notices) == 2
     assert notices[0]["imageUri"] == "http://192.168.0.4:8088/images/token/rs:fill:672:936:0/minio.webp"
     assert notices[1]["imageUri"] is None
+
+
+@pytest.mark.asyncio
+async def test_decks_overlap_derives_colors_from_cards():
+    from types import SimpleNamespace as NS
+    from unittest.mock import AsyncMock, patch
+    from src.services.deck_service import DeckService
+
+    card = NS(id="c1", deckId="d1", cardName="Counterspell", cardScryfallId="cs", quantity=1, assignedQuantity=0,
+              isSideboard=False, manaCost="{U}{U}", typeLine="Instant", imageUri=None)
+    deck = NS(id="d1", name="Azul", commander=None, commanderImageUri=None, cards=[card])
+    with patch("src.services.deck_service.db") as db:
+        db.deck.find_many = AsyncMock(return_value=[deck])
+        result = await DeckService.get_decks_overlap("u1")
+    assert result["decks"][0]["colors"] == ["U"]

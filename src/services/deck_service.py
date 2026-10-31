@@ -825,7 +825,8 @@ class DeckService:
                 "name": d.name,
                 "commander": d.commander,
                 "commanderImageUri": d.commanderImageUri,
-                "colors": d.colors or [],
+                # Decks have no stored colors; derive them like every deck summary.
+                "colors": colors_by_deck(d.cards or []).get(d.id, []),
                 "totalCards": sum(c.quantity for c in (d.cards or [])),
                 "nonBasicCardsCount": len(non_basic_cards),
             })

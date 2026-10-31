@@ -270,7 +270,9 @@ class PricingService:
 
         all_printings = list(printings_by_id.values()) + list(printings_by_norm.values())
         if not all_printings:
-            return {}
+            # Keep the quotes already served from the cache: returning {} here
+            # dropped every cached price when the uncached rest had no printing.
+            return results
 
         # 3. Latest history only for printings still missing on-row prices
         history_map = await PricingService._latest_history_for_printings(
@@ -761,15 +763,27 @@ class PricingService:
                   WHERE h.finish = 0
                     AND h.date BETWEEN ($2::date - 7) AND $3::date
                 )
+                -- Each observation covers the days until the next one. Expanding
+                -- those ranges joins by (id, day) instead of comparing every day
+                -- with every observation of every card.
+                , covered AS (
+                  SELECT gs::date AS d, s.scryfall_id, s.price_cents
+                  FROM series s
+                  CROSS JOIN LATERAL generate_series(
+                    GREATEST(s.d, $2::date),
+                    LEAST(COALESCE(s.next_d - 1, $3::date), $3::date),
+                    interval '1 day'
+                  ) gs
+                ),
+                totals AS (
+                  SELECT c.d, SUM(q.qty * c.price_cents / 100.0) AS total
+                  FROM covered c JOIN qtys q ON q.id = c.scryfall_id
+                  GROUP BY c.d
+                )
                 SELECT days.d::text AS day,
-                       ROUND(SUM(q.qty * COALESCE(s.price_cents, 0) / 100.0)::numeric, 2) AS total
+                       ROUND(COALESCE(totals.total, 0)::numeric, 2) AS total
                 FROM days
-                CROSS JOIN qtys q
-                LEFT JOIN series s
-                  ON s.scryfall_id = q.id
-                 AND s.d <= days.d
-                 AND (s.next_d IS NULL OR s.next_d > days.d)
-                GROUP BY days.d
+                LEFT JOIN totals ON totals.d = days.d
                 ORDER BY days.d
                 """,
                 _json.dumps(qty_rows),

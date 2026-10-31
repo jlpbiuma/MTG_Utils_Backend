@@ -240,3 +240,43 @@ async def test_query_reports_deck_demand_and_sorts_by_it():
     assert by_name["Arcane Signet"].requestedInDecks[0].quantity == 2
     assert by_name["Command Tower"].requestedInDecksCount == 0
     assert [c.cardName for c in result.cards] == ["Sol Ring", "Arcane Signet", "Command Tower"]
+
+def _quote(trend):
+    return SimpleNamespace(unitPrice=SimpleNamespace(trend=trend), subtotal=trend)
+
+
+@pytest.mark.asyncio
+async def test_grouped_pages_are_consecutive_slices_with_whole_section_totals():
+    records = [_card(f"c{i}", f"Creature {i:02}", f"s{i}", type_line="Creature") for i in range(5)]
+    records += [_card(f"l{i}", f"Land {i:02}", f"t{i}", qty=2, type_line="Land") for i in range(3)]
+
+    pages = [await _call_query(records, grouped=True, page=page, limit=3) for page in (1, 2, 3)]
+
+    names = [[c.cardName for s in p.sections for c in s.cards] for p in pages]
+    assert names == [["Creature 00", "Creature 01", "Creature 02"],
+                     ["Creature 03", "Creature 04", "Land 00"],
+                     ["Land 01", "Land 02"]]
+    assert [p.hasMore for p in pages] == [True, True, False]
+    assert all(p.uniqueCards == 8 and p.totalCards == 11 for p in pages)
+    # A section split across pages keeps the totals of the whole section.
+    assert [(s.key, s.uniqueCards, s.totalCards) for s in pages[1].sections] == [("creatures", 5, 5), ("lands", 3, 6)]
+
+
+@pytest.mark.asyncio
+async def test_price_filter_runs_over_the_whole_collection_before_paginating():
+    records = [_card(f"c{i}", f"Card {i:02}", f"s{i}") for i in range(6)]
+    quotes = {f"s{i}": _quote(float(i)) for i in range(5)}  # s5 has no price
+    mock_db = MagicMock()
+    mock_db.collectioncard.find_many = AsyncMock(return_value=records)
+    mock_db.deckcard.find_many = AsyncMock(return_value=[])
+    with (
+        patch("src.services.collection_service.db", mock_db),
+        patch("src.services.collection_service.resolve_minio_image_uris", new=AsyncMock(return_value={})),
+        patch("src.services.collection_service.PricingService.get_price_summary", new=AsyncMock(return_value=_fake_summary(quotes))),
+    ):
+        first = await CollectionService.get_user_collection_query("user-1", grouped=False, min_price=1, max_price=3, page=1, limit=2)
+        second = await CollectionService.get_user_collection_query("user-1", grouped=False, min_price=1, max_price=3, page=2, limit=2)
+
+    assert first.uniqueCards == second.uniqueCards == 3
+    assert [c.cardName for c in first.cards + second.cards] == ["Card 01", "Card 02", "Card 03"]
+    assert first.hasMore is True and second.hasMore is False

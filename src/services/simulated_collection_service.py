@@ -38,6 +38,10 @@ class OfferAnalysisContext:
     resolved_names: dict
     printings: list
     reprints: dict
+    # Deck completion, colors and demand derived from user_data, computed once
+    # per request instead of once per offer.
+    derived: Optional[tuple] = None
+    completion: Optional[Any] = None
 
 
 class SimulatedCollectionService:
@@ -47,16 +51,39 @@ class SimulatedCollectionService:
             db.deck.find_many(where={"userId": user_id, "isArchived": False}, include={"cards": True}),
             db.collectioncard.find_many(where={"userId": user_id}),
             db.wantcard.find_many(where={"userId": user_id}),
-            resolve_offer_names(names, db),
+            resolve_offer_names(names, db, allow_remote=False),
         )
         canonical = [resolved.get(fold_search_text(name), name) for name in names]
         norms = sorted({normalize_card_name(name) for name in canonical})
-        printings = await db.cardprinting.find_many(
-            where={"catalog": {"normalizedName": {"in": norms}}},
-            include={"catalog": True, "set": True},
-        ) if norms else []
+        printings = await SimulatedCollectionService._printings_for_norms(norms)
         reprints = await upcoming_reprints_by_name(canonical, printings, db)
         return OfferAnalysisContext(user_id, (decks, collection, wants), resolved, printings, reprints)
+
+    @staticmethod
+    async def _printings_for_norms(norms):
+        """Printings with their catalog and set, each related row loaded once.
+
+        Including the catalog per printing repeated its large localized
+        details for every edition (15k printings for 2k cards). The printing
+        query keeps its previous filter, so results and order are unchanged.
+        """
+        if not norms:
+            return []
+        printings = await db.cardprinting.find_many(where={"catalog": {"normalizedName": {"in": list(norms)}}})
+        catalog_ids = list({p.catalogId for p in printings if getattr(p, "catalogId", None)})
+        set_ids = list({p.setId for p in printings if getattr(p, "setId", None)})
+        catalogs, sets = await asyncio.gather(
+            db.cardcatalog.find_many(where={"id": {"in": catalog_ids}}) if catalog_ids else asyncio.sleep(0, []),
+            db.cardset.find_many(where={"id": {"in": set_ids}}) if set_ids else asyncio.sleep(0, []),
+        )
+        catalogs_by_id = {catalog.id: catalog for catalog in catalogs}
+        sets_by_id = {card_set.id: card_set for card_set in sets}
+        for printing in printings:
+            if getattr(printing, "catalogId", None) in catalogs_by_id:
+                printing.catalog = catalogs_by_id[printing.catalogId]
+            if getattr(printing, "setId", None) in sets_by_id:
+                printing.set = sets_by_id[printing.setId]
+        return printings
 
     @staticmethod
     def _saved_names(coll):
@@ -136,6 +163,46 @@ class SimulatedCollectionService:
         )
 
     @staticmethod
+    def _derive_user_data(user_decks, real_collection, wants):
+        """Owned copies, wanted names and per-name deck demand; read-only for callers."""
+        col_map: Dict[str, int] = {}
+        for c in real_collection:
+            norm = normalize_card_name(c.cardName)
+            col_map[norm] = col_map.get(norm, 0) + c.quantity
+
+        want_names = {normalize_card_name(w.cardName) for w in wants}
+
+        # Deck completion % and colors
+        all_deck_cards = [c for d in user_decks for c in (d.cards or [])]
+        completions = completion_percentages_by_deck(all_deck_cards, col_map)
+        deck_colors = colors_by_deck(all_deck_cards)
+
+        deck_completion_totals: Dict[str, int] = {}
+        deck_cards_by_norm: Dict[str, List[Dict[str, Any]]] = {}
+
+        for d in user_decks:
+            total_count, owned_count = completion_counts(d.cards or [], col_map)
+            for c in completion_cards(d.cards or []):
+                norm = normalize_card_name(c.cardName)
+                if norm not in deck_cards_by_norm:
+                    deck_cards_by_norm[norm] = []
+                deck_cards_by_norm[norm].append({
+                    "deckId": d.id,
+                    "deckName": d.name,
+                    "completionPercentage": completions.get(d.id, 0.0),
+                    "ownedCards": owned_count,
+                    "colors": deck_colors.get(d.id, []),
+                    "requestedQuantity": c.quantity,
+                    "assignedQuantity": c.assignedQuantity or 0,
+                    "typeLine": c.typeLine,
+                    "manaCost": c.manaCost,
+                    "imageUri": c.imageUri,
+                    "cardScryfallId": c.cardScryfallId,
+                })
+            deck_completion_totals[d.id] = total_count
+        return col_map, want_names, deck_cards_by_norm, deck_completion_totals
+
+    @staticmethod
     async def _run_analysis(
         user_id: str,
         cards_input: List[Dict[str, Any]],
@@ -179,42 +246,15 @@ class SimulatedCollectionService:
             db.collectioncard.find_many(where={"userId": user_id}),
             db.wantcard.find_many(where={"userId": user_id}),
         )
-        col_map: Dict[str, int] = {}
-        for c in real_collection:
-            norm = normalize_card_name(c.cardName)
-            col_map[norm] = col_map.get(norm, 0) + c.quantity
+        if context is not None and context.derived is not None:
+            col_map, want_names, deck_cards_by_norm, deck_completion_totals = context.derived
+        else:
+            col_map, want_names, deck_cards_by_norm, deck_completion_totals = SimulatedCollectionService._derive_user_data(
+                user_decks, real_collection, wants)
+            if context is not None:
+                context.derived = (col_map, want_names, deck_cards_by_norm, deck_completion_totals)
 
-        want_names = {normalize_card_name(w.cardName) for w in wants}
-
-        # 3. Calculate deck completion % and colors
         all_deck_cards = [c for d in user_decks for c in (d.cards or [])]
-        completions = completion_percentages_by_deck(all_deck_cards, col_map)
-        deck_colors = colors_by_deck(all_deck_cards)
-
-        deck_completion_totals: Dict[str, int] = {}
-        deck_cards_by_norm: Dict[str, List[Dict[str, Any]]] = {}
-
-        for d in user_decks:
-            total_count, owned_count = completion_counts(d.cards or [], col_map)
-            for c in completion_cards(d.cards or []):
-                norm = normalize_card_name(c.cardName)
-                if norm not in deck_cards_by_norm:
-                    deck_cards_by_norm[norm] = []
-                deck_cards_by_norm[norm].append({
-                    "deckId": d.id,
-                    "deckName": d.name,
-                    "completionPercentage": completions.get(d.id, 0.0),
-                    "ownedCards": owned_count,
-                    "colors": deck_colors.get(d.id, []),
-                    "requestedQuantity": c.quantity,
-                    "assignedQuantity": c.assignedQuantity or 0,
-                    "typeLine": c.typeLine,
-                    "manaCost": c.manaCost,
-                    "imageUri": c.imageUri,
-                    "cardScryfallId": c.cardScryfallId,
-                })
-            deck_completion_totals[d.id] = total_count
-
         total_completion_cards = sum(deck_completion_totals.values())
 
         # 4. Resolve cheapest positive printings for cards in the simulation
@@ -316,6 +356,13 @@ class SimulatedCollectionService:
                 "image_uri": safe_image_uri(img) if img else None,
             }
 
+        # First printing per (name, set, collector number), as the linear scan returned.
+        printings_by_identity: Dict[tuple, Any] = {}
+        for p in all_printings:
+            identity = (normalize_card_name(getattr(p.catalog, "normalizedName", "")),
+                        (getattr(getattr(p, "set", None), "code", "") or "").lower(), str(getattr(p, "collectorNumber", "")))
+            printings_by_identity.setdefault(identity, p)
+
         for c in cards_input:
             card_name = c["cardName"]
             quantity = c["quantity"]
@@ -332,11 +379,8 @@ class SimulatedCollectionService:
             collector_number = c.get("collectorNumber")
             selected_printing = None
 
-            exact_source = next((p for p in all_printings
-                if normalize_card_name(getattr(p.catalog, "normalizedName", "")) == norm
-                and c.get("setCode") and c.get("collectorNumber")
-                and (getattr(getattr(p, "set", None), "code", "") or "").lower() == c["setCode"].lower()
-                and str(getattr(p, "collectorNumber", "")) == str(c["collectorNumber"])), None)
+            exact_source = printings_by_identity.get((norm, c["setCode"].lower(), str(c["collectorNumber"]))) if (
+                c.get("setCode") and c.get("collectorNumber")) else None
             if norm in selected_printings or exact_source:
                 p = selected_printings.get(norm) or exact_source
                 selected_printing = p
@@ -540,7 +584,7 @@ class SimulatedCollectionService:
             history_statistics = None
             history_covered = history_missing = 0
 
-        from src.services.opportunity_completion import enrich_completion
+        from src.services.opportunity_completion import completion_baseline, enrich_completion
         matches = []
         wants_by_name = {}
         for want in wants:
@@ -563,7 +607,12 @@ class SimulatedCollectionService:
                 matched_want=WantMatchInfo(want_id=getattr(requested[0], "id", "") if requested else "", quantity_wanted=capacity,
                                           requested_decks=[deck.deckName for deck in card.candidateDecks]),
             ))
-        deck_count, before = enrich_completion(matches, user_decks, all_deck_cards, real_collection)
+        baseline = None
+        if context is not None:
+            if context.completion is None:
+                context.completion = completion_baseline(user_decks, all_deck_cards, real_collection)
+            baseline = context.completion
+        deck_count, before = enrich_completion(matches, user_decks, all_deck_cards, real_collection, baseline)
         projected = dict(col_map)
         for card in analysis_cards:
             if card.quantity > 0:

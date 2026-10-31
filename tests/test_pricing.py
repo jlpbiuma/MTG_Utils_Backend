@@ -225,3 +225,28 @@ async def test_deck_pricing_excludes_basic_lands_from_missing_value():
     assert summary.totalMissingValue == 3.00
     assert round(summary.totalNetValue - summary.totalMissingValue, 2) == summary.totalOwnedValue
 
+
+
+@pytest.mark.asyncio
+async def test_cached_quotes_survive_when_the_uncached_rest_has_no_printing():
+    """A warm cache must not turn every deck value into None on the next request."""
+    from types import SimpleNamespace as NS
+    from src.services import pricing_service
+
+    pricing_service.clear_price_cache()
+    quote = CardPriceQuote(scryfallId="bolt-id", cardName="Lightning Bolt", provider="cardmarket", currency="EUR",
+                           currencySymbol="€", unitPrice=UnitPriceBreakdown(trend=1.5, min=1.0, max=2.0),
+                           quantity=1, subtotal=1.5, purchaseUrl=None, lastUpdated=datetime.now())
+    pricing_service._price_cache["cardmarket:bolt-id"] = {"timestamp": pricing_service.time.time(), "quote": quote}
+    db = MagicMock()
+    db.cardprinting.find_many = AsyncMock(return_value=[])
+    with patch("src.services.pricing_service.db", db), \
+         patch.object(PricingService, "_cheapest_printings_by_norm", AsyncMock(return_value={})):
+        result = await PricingService.get_latest_quotes_batch(
+            [{"scryfallId": "bolt-id", "name": "Lightning Bolt"}, {"scryfallId": "unknown-id", "name": "Homebrew"}],
+            "cardmarket", "EUR",
+        )
+    pricing_service.clear_price_cache()
+    assert result["bolt-id"].unitPrice.trend == 1.5
+    assert result["lightning bolt"].unitPrice.trend == 1.5
+    assert "unknown-id" not in result

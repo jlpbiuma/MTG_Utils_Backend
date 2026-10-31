@@ -18,7 +18,15 @@ class DeckAssignmentService:
                        LIMIT 1
                    )) AS "imageUri"
             FROM deck_assignment_notices n JOIN decks d ON d.id = n.deck_id
-            LEFT JOIN card_catalog c ON (LOWER(c.name) = LOWER(n.card_name) OR c.normalized_name = LOWER(n.card_name))
+            -- One catalog card per notice, through indexed lookups: an OR join
+            -- scanned the whole catalog and could repeat a notice.
+            LEFT JOIN LATERAL (
+                SELECT m.id, m.image_uri FROM (
+                    SELECT cc.id, cc.image_uri, 0 AS rank FROM card_catalog cc WHERE cc.normalized_name = LOWER(n.card_name)
+                    UNION ALL
+                    SELECT cc.id, cc.image_uri, 1 FROM card_catalog cc WHERE LOWER(cc.name) = LOWER(n.card_name)
+                ) m ORDER BY m.rank, m.id LIMIT 1
+            ) c ON true
             WHERE n.user_id = $1 AND d.user_id = $1
               AND n.accepted_at IS NULL AND NOT d.is_archived
             ORDER BY n.created_at, n.id
